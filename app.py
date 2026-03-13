@@ -10,7 +10,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.2.0")
+app = FastAPI(title="Signal Agent API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -716,6 +716,79 @@ def risk(event: RiskEvent) -> dict[str, Any]:
         conn.close()
 
     return {"status": "ok"}
+
+
+# -------------------------------------------------------------------
+# SIGNAL HISTORY
+# -------------------------------------------------------------------
+@app.get("/signals/history")
+def signals_history(limit: int = 20) -> dict[str, Any]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        SELECT created_utc, symbol, action, status, tv_id, tv_ts, updated_utc, note
+        FROM signal_log
+        ORDER BY id DESC
+        LIMIT ?
+        """, (limit,))
+
+        rows = cur.fetchall()
+        conn.close()
+
+    return {
+        "signals": [
+            {
+                "time": r["created_utc"],
+                "symbol": r["symbol"],
+                "action": r["action"],
+                "status": r["status"],
+                "tv_id": r["tv_id"],
+                "tv_ts": r["tv_ts"],
+                "updated_utc": r["updated_utc"],
+                "note": r["note"],
+            }
+            for r in rows
+        ]
+    }
+
+
+# -------------------------------------------------------------------
+# RISK HISTORY
+# -------------------------------------------------------------------
+@app.get("/risk/history")
+def risk_history(limit: int = 20) -> dict[str, Any]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        SELECT created_utc, account, symbol, risk_usd, lots, position_id, magic, entry_price, sl
+        FROM risk_events
+        ORDER BY id DESC
+        LIMIT ?
+        """, (limit,))
+
+        rows = cur.fetchall()
+        conn.close()
+
+    return {
+        "risk": [
+            {
+                "time": r["created_utc"],
+                "account": r["account"],
+                "symbol": r["symbol"],
+                "risk_usd": r["risk_usd"],
+                "lots": r["lots"],
+                "position_id": r["position_id"],
+                "magic": r["magic"],
+                "entry_price": r["entry_price"],
+                "sl": r["sl"],
+            }
+            for r in rows
+        ]
+    }
 
 
 # -------------------------------------------------------------------
