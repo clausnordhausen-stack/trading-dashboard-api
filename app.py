@@ -1,168 +1,748 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any
+from jose import jwt, JWTError
+import hashlib
 import os
+import sqlite3
+import threading
 
-app = FastAPI()
+app = FastAPI(title="Signal Agent API", version="3.1.0")
 
-SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 
-SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", 30))
-PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", 120))
+SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
+SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "1800"))
+DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
-# ------------------------------
+# Login / JWT
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+APP_USERNAME = os.getenv("APP_USERNAME", "admin")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
+
+DB_LOCK = threading.Lock()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# -------------------------------------------------------------------
 # MODELS
-# ------------------------------
-
+# -------------------------------------------------------------------
 class TVSignal(BaseModel):
     key: str
     symbol: str
     action: str
-    id: str | None = None
-    ts: str | None = None
+    ts: Optional[str] = None
+    id: Optional[str] = None
 
 
-# ------------------------------
-# STATE
-# ------------------------------
+class RiskEvent(BaseModel):
+    account: Optional[str] = None
+    symbol: str
+    position_id: Optional[str] = None
+    magic: Optional[int] = None
+    open_time: Optional[str] = None
+    entry_price: Optional[float] = None
+    sl: Optional[float] = None
+    lots: Optional[float] = None
+    risk_usd: Optional[float] = None
+    source: Optional[str] = None
 
-STATE = {}
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
-def now():
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class UserResponse(BaseModel):
+    username: str
+
+
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+def now_utc_dt() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def norm_symbol(s):
-    return s.upper().strip()
+def now_utc_iso() -> str:
+    return now_utc_dt().isoformat()
 
 
-def norm_action(a):
-    return a.upper().strip()
+def parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
-# ------------------------------
+def secs_left(future_dt: Optional[datetime]) -> int:
+    if future_dt is None:
+        return 0
+    return max(0, int((future_dt - now_utc_dt()).total_seconds()))
+
+
+def norm_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+
+    if s in {"GOLD", "XAU", "XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"}:
+        return "XAUUSD"
+
+    if s in {"BTC", "BTCUSD", "BITCOIN", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"}:
+        return "BTCUSD"
+
+    return s
+
+
+def norm_action(a: str) -> str:
+    return (a or "").strip().upper()
+
+
+def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
+    raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# -------------------------------------------------------------------
+# LOGIN / JWT HELPERS
+# -------------------------------------------------------------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = now_utc_dt() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def authenticate_user(username: str, password: str) -> bool:
+    return username == APP_USERNAME and password == APP_PASSWORD
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> UserResponse:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Ungültiger oder abgelaufener Token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise credentials_exception
+        return UserResponse(username=username)
+    except JWTError:
+        raise credentials_exception
+
+
+# -------------------------------------------------------------------
+# DB
+# -------------------------------------------------------------------
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_state (
+            symbol TEXT PRIMARY KEY,
+
+            active_updated_utc TEXT,
+            active_action TEXT,
+            active_tv_id TEXT,
+            active_tv_ts TEXT,
+            active_payload_hash TEXT,
+            active_created_utc TEXT,
+
+            cooldown_until_utc TEXT,
+
+            last_seen_tv_id TEXT,
+            last_seen_tv_ts TEXT,
+            last_seen_action TEXT,
+            last_seen_payload_hash TEXT,
+
+            updated_utc TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_delivery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            account TEXT,
+            magic TEXT,
+            delivered INTEGER NOT NULL DEFAULT 0,
+            delivered_utc TEXT,
+            acked INTEGER NOT NULL DEFAULT 0,
+            acked_utc TEXT,
+            UNIQUE(symbol, updated_utc, account, magic)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_utc TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT,
+            tv_id TEXT,
+            tv_ts TEXT,
+            updated_utc TEXT,
+            status TEXT NOT NULL,
+            note TEXT,
+            payload_hash TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS risk_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_utc TEXT NOT NULL,
+            account TEXT,
+            symbol TEXT NOT NULL,
+            position_id TEXT,
+            magic INTEGER,
+            open_time TEXT,
+            entry_price REAL,
+            sl REAL,
+            lots REAL,
+            risk_usd REAL,
+            source TEXT
+        )
+        """)
+
+        conn.commit()
+        conn.close()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+
+
+def get_state(conn: sqlite3.Connection, symbol: str) -> Optional[sqlite3.Row]:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM symbol_state WHERE symbol = ?", (symbol,))
+    return cur.fetchone()
+
+
+def upsert_empty_state(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
+    row = get_state(conn, symbol)
+    if row is not None:
+        return row
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO symbol_state (symbol, updated_utc)
+        VALUES (?, ?)
+    """, (symbol, now_utc_iso()))
+    conn.commit()
+    return get_state(conn, symbol)
+
+
+def log_signal(
+    conn: sqlite3.Connection,
+    symbol: str,
+    action: Optional[str],
+    tv_id: Optional[str],
+    tv_ts: Optional[str],
+    updated_utc: Optional[str],
+    status: str,
+    note: str,
+    phash: Optional[str]
+) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO signal_log (
+            created_utc, symbol, action, tv_id, tv_ts, updated_utc,
+            status, note, payload_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        now_utc_iso(), symbol, action, tv_id, tv_ts, updated_utc,
+        status, note, phash
+    ))
+    conn.commit()
+
+
+def clear_active_signal(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
+    row = get_state(conn, symbol)
+    if row is None or not row["active_updated_utc"]:
+        return
+
+    log_signal(
+        conn,
+        symbol,
+        row["active_action"],
+        row["active_tv_id"],
+        row["active_tv_ts"],
+        row["active_updated_utc"],
+        "signal_cleared",
+        reason,
+        row["active_payload_hash"]
+    )
+
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE symbol_state
+        SET
+            active_updated_utc = NULL,
+            active_action = NULL,
+            active_tv_id = NULL,
+            active_tv_ts = NULL,
+            active_payload_hash = NULL,
+            active_created_utc = NULL,
+            updated_utc = ?
+        WHERE symbol = ?
+    """, (now_utc_iso(), symbol))
+    conn.commit()
+
+
+def expire_active_signal_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
+    row = upsert_empty_state(conn, symbol)
+
+    if not row["active_updated_utc"]:
+        return row
+
+    created = parse_iso(row["active_created_utc"])
+    if created is None:
+        clear_active_signal(conn, symbol, "active signal had invalid timestamp")
+        return get_state(conn, symbol)
+
+    age = int((now_utc_dt() - created).total_seconds())
+    if age >= SIGNAL_TTL_SEC:
+        clear_active_signal(conn, symbol, f"active signal expired after {age}s")
+        return get_state(conn, symbol)
+
+    return row
+
+
+def ensure_delivery_row(
+    conn: sqlite3.Connection,
+    symbol: str,
+    updated_utc: str,
+    account: str,
+    magic: str
+) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO signal_delivery (
+            symbol, updated_utc, account, magic, delivered, acked
+        ) VALUES (?, ?, ?, ?, 0, 0)
+    """, (symbol, updated_utc, account, magic))
+    conn.commit()
+
+    cur.execute("""
+        SELECT * FROM signal_delivery
+        WHERE symbol = ? AND updated_utc = ? AND account = ? AND magic = ?
+    """, (symbol, updated_utc, account, magic))
+    return cur.fetchone()
+
+
+# -------------------------------------------------------------------
 # ROOT
-# ------------------------------
-
+# -------------------------------------------------------------------
 @app.get("/")
-def root():
-    return {"status": "Signal Agent API running"}
-
-
-# ------------------------------
-# TV SIGNAL INGEST
-# ------------------------------
-
-@app.post("/tv")
-def tv_signal(sig: TVSignal):
-
-    if sig.key != SECRET_KEY:
-        raise HTTPException(status_code=403, detail="invalid key")
-
-    symbol = norm_symbol(sig.symbol)
-    action = norm_action(sig.action)
-
-    if action not in ["BUY", "SELL"]:
-        raise HTTPException(status_code=400, detail="invalid action")
-
-    state = STATE.get(symbol)
-
-    now_time = now()
-
-    # create state if missing
-    if not state:
-        STATE[symbol] = {
-            "pending": None,
-            "cooldown_until": None,
-            "last_signal_id": None
-        }
-        state = STATE[symbol]
-
-    # 30 MIN COOLDOWN
-    if state["cooldown_until"]:
-        if now_time < state["cooldown_until"]:
-            return {"status": "cooldown_active"}
-
-    # DUPLICATE SIGNAL BLOCK
-    if sig.id and sig.id == state["last_signal_id"]:
-        return {"status": "duplicate_blocked"}
-
-    # CREATE PENDING SIGNAL
-    pending = {
-        "symbol": symbol,
-        "action": action,
-        "id": sig.id,
-        "created": now_time.isoformat()
+def root() -> dict[str, Any]:
+    return {
+        "status": "Signal Agent API running",
+        "mode": "multi_account_broadcast",
+        "login_enabled": True,
+        "cooldown_min": SYMBOL_COOLDOWN_MIN,
+        "signal_ttl_sec": SIGNAL_TTL_SEC
     }
 
-    state["pending"] = pending
-    state["last_signal_id"] = sig.id
 
-    return {"status": "signal_received", "symbol": symbol}
+# -------------------------------------------------------------------
+# LOGIN
+# -------------------------------------------------------------------
+@app.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest) -> dict[str, str]:
+    if not authenticate_user(data.username, data.password):
+        raise HTTPException(status_code=401, detail="Benutzername oder Passwort falsch")
 
-
-# ------------------------------
-# EA POLL LATEST SIGNAL
-# ------------------------------
-
-@app.get("/latest")
-def latest(symbol: str, account: str = "", magic: str = ""):
-
-    symbol = norm_symbol(symbol)
-
-    state = STATE.get(symbol)
-
-    if not state:
-        return {"signal": None}
-
-    pending = state["pending"]
-
-    if not pending:
-        return {"signal": None}
-
-    created = datetime.fromisoformat(pending["created"])
-
-    # EXPIRE OLD SIGNAL
-    if now() - created > timedelta(seconds=PENDING_TTL_SEC):
-        state["pending"] = None
-        return {"signal": None}
+    access_token = create_access_token(
+        data={"sub": data.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
 
     return {
-        "signal": {
-            "symbol": pending["symbol"],
-            "action": pending["action"]
-        },
-        "updated_utc": pending["created"]
+        "access_token": access_token,
+        "token_type": "bearer"
     }
 
 
-# ------------------------------
-# EA ACK TRADE EXECUTION
-# ------------------------------
+@app.get("/me", response_model=UserResponse)
+def me(current_user: UserResponse = Depends(get_current_user)) -> UserResponse:
+    return current_user
 
+
+# -------------------------------------------------------------------
+# TV INGEST
+# -------------------------------------------------------------------
+@app.post("/tv")
+def tv(signal: TVSignal) -> dict[str, Any]:
+    if signal.key != SECRET_KEY:
+        raise HTTPException(status_code=401, detail="invalid key")
+
+    symbol = norm_symbol(signal.symbol)
+    action = norm_action(signal.action)
+    tv_id = (signal.id or "").strip()
+    tv_ts = (signal.ts or "").strip()
+    phash = payload_hash(symbol, action, tv_id, tv_ts)
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="action must be BUY or SELL")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_active_signal_if_needed(conn, symbol)
+        now = now_utc_dt()
+
+        cooldown_until = parse_iso(row["cooldown_until_utc"])
+        if cooldown_until and now < cooldown_until:
+            left = secs_left(cooldown_until)
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, None,
+                "ignored_cooldown", f"cooldown active, {left}s left", phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_cooldown",
+                "symbol": symbol,
+                "cooldown_left_sec": left
+            }
+
+        if row["active_updated_utc"]:
+            created = parse_iso(row["active_created_utc"])
+            ttl_left = max(0, SIGNAL_TTL_SEC - int((now - created).total_seconds())) if created else 0
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, row["active_updated_utc"],
+                "ignored_active_exists", f"signal already active, ttl_left={ttl_left}s", phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_active_exists",
+                "symbol": symbol,
+                "active_updated_utc": row["active_updated_utc"],
+                "signal_ttl_left_sec": ttl_left
+            }
+
+        if row["last_seen_payload_hash"] == phash:
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, None,
+                "ignored_duplicate_payload", "same payload hash already seen", phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_duplicate_payload",
+                "symbol": symbol
+            }
+
+        updated_utc = now_utc_iso()
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE symbol_state
+            SET
+                active_updated_utc = ?,
+                active_action = ?,
+                active_tv_id = ?,
+                active_tv_ts = ?,
+                active_payload_hash = ?,
+                active_created_utc = ?,
+
+                cooldown_until_utc = ?,
+
+                last_seen_tv_id = ?,
+                last_seen_tv_ts = ?,
+                last_seen_action = ?,
+                last_seen_payload_hash = ?,
+
+                updated_utc = ?
+            WHERE symbol = ?
+        """, (
+            updated_utc,
+            action,
+            tv_id or None,
+            tv_ts or None,
+            phash,
+            updated_utc,
+
+            (now + timedelta(minutes=SYMBOL_COOLDOWN_MIN)).isoformat(),
+
+            tv_id or None,
+            tv_ts or None,
+            action,
+            phash,
+
+            updated_utc,
+            symbol
+        ))
+        conn.commit()
+
+        log_signal(
+            conn, symbol, action, tv_id, tv_ts, updated_utc,
+            "accepted_broadcast", "broadcast signal accepted", phash
+        )
+
+        conn.close()
+        return {
+            "status": "accepted",
+            "symbol": symbol,
+            "action": action,
+            "updated_utc": updated_utc,
+            "cooldown_min": SYMBOL_COOLDOWN_MIN
+        }
+
+
+# -------------------------------------------------------------------
+# LATEST - every account can fetch the same active signal
+# -------------------------------------------------------------------
+@app.get("/latest")
+def latest(
+    symbol: str,
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None)
+) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    acc = (account or "").strip()
+    mag = (magic or "").strip()
+
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_active_signal_if_needed(conn, sym)
+
+        if not row["active_updated_utc"]:
+            cooldown_until = parse_iso(row["cooldown_until_utc"])
+            conn.close()
+            return {
+                "symbol": sym,
+                "signal": None,
+                "updated_utc": "",
+                "cooldown_left_sec": secs_left(cooldown_until)
+            }
+
+        updated_utc = row["active_updated_utc"]
+        delivery = ensure_delivery_row(conn, sym, updated_utc, acc, mag)
+
+        if int(delivery["acked"]) == 1:
+            conn.close()
+            return {
+                "symbol": sym,
+                "signal": None,
+                "updated_utc": "",
+                "cooldown_left_sec": 0
+            }
+
+        if int(delivery["delivered"]) == 0:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE signal_delivery
+                SET delivered = 1, delivered_utc = ?
+                WHERE id = ?
+            """, (now_utc_iso(), delivery["id"]))
+            conn.commit()
+
+        conn.close()
+        return {
+            "symbol": sym,
+            "updated_utc": updated_utc,
+            "signal": {
+                "symbol": sym,
+                "action": row["active_action"]
+            },
+            "account": acc,
+            "magic": mag,
+            "cooldown_left_sec": 0
+        }
+
+
+# -------------------------------------------------------------------
+# ACK - each account+magic ACKs once per active signal
+# -------------------------------------------------------------------
 @app.post("/ack")
-def ack(symbol: str, updated_utc: str, account: str = "", magic: str = ""):
+def ack(
+    symbol: str,
+    updated_utc: str,
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None)
+) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    upd = (updated_utc or "").strip()
+    acc = (account or "").strip()
+    mag = (magic or "").strip()
 
-    symbol = norm_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if not upd:
+        raise HTTPException(status_code=400, detail="updated_utc required")
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
 
-    state = STATE.get(symbol)
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_active_signal_if_needed(conn, sym)
 
-    if not state:
-        return {"status": "no_state"}
+        if not row["active_updated_utc"]:
+            conn.close()
+            return {
+                "status": "no_active_signal",
+                "symbol": sym,
+                "updated_utc": upd
+            }
 
-    pending = state["pending"]
+        if row["active_updated_utc"] != upd:
+            conn.close()
+            return {
+                "status": "ignored_unknown_updated_utc",
+                "symbol": sym,
+                "updated_utc": upd
+            }
 
-    if not pending:
-        return {"status": "no_pending"}
+        delivery = ensure_delivery_row(conn, sym, upd, acc, mag)
 
-    if pending["created"] != updated_utc:
-        return {"status": "signal_mismatch"}
+        if int(delivery["acked"]) == 1:
+            conn.close()
+            return {
+                "status": "already_acked",
+                "symbol": sym,
+                "updated_utc": upd
+            }
 
-    # CLEAR PENDING
-    state["pending"] = None
+        now_iso = now_utc_iso()
 
-    # START 30 MIN COOLDOWN
-    state["cooldown_until"] = now() + timedelta(minutes=SYMBOL_COOLDOWN_MIN)
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE signal_delivery
+            SET
+                delivered = 1,
+                delivered_utc = COALESCE(delivered_utc, ?),
+                acked = 1,
+                acked_utc = ?
+            WHERE id = ?
+        """, (now_iso, now_iso, delivery["id"]))
+        conn.commit()
 
-    return {"status": "acknowledged"}
+        conn.close()
+        return {
+            "status": "acked",
+            "symbol": sym,
+            "updated_utc": upd,
+            "account": acc,
+            "magic": mag
+        }
+
+
+# -------------------------------------------------------------------
+# GATE COMPAT
+# -------------------------------------------------------------------
+@app.get("/status/gate_combo")
+def gate_combo(symbol: str) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    lvl = DEFAULT_GATE_LEVEL if DEFAULT_GATE_LEVEL in {"GREEN", "YELLOW", "RED"} else "GREEN"
+    return {
+        "symbol": sym,
+        "combo_level": lvl,
+        "usd_level": lvl,
+        "r_level": lvl
+    }
+
+
+# -------------------------------------------------------------------
+# RISK COMPAT
+# -------------------------------------------------------------------
+@app.post("/risk")
+def risk(event: RiskEvent) -> dict[str, Any]:
+    sym = norm_symbol(event.symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO risk_events (
+                created_utc, account, symbol, position_id, magic, open_time,
+                entry_price, sl, lots, risk_usd, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now_utc_iso(),
+            event.account,
+            sym,
+            event.position_id,
+            event.magic,
+            event.open_time,
+            event.entry_price,
+            event.sl,
+            event.lots,
+            event.risk_usd,
+            event.source
+        ))
+        conn.commit()
+        conn.close()
+
+    return {"status": "ok"}
+
+
+# -------------------------------------------------------------------
+# DEBUG
+# -------------------------------------------------------------------
+@app.get("/debug/state")
+def debug_state(symbol: str) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_active_signal_if_needed(conn, sym)
+
+        deliveries = []
+        if row["active_updated_utc"]:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT account, magic, delivered, delivered_utc, acked, acked_utc
+                FROM signal_delivery
+                WHERE symbol = ? AND updated_utc = ?
+                ORDER BY account, magic
+            """, (sym, row["active_updated_utc"]))
+            deliveries = [dict(r) for r in cur.fetchall()]
+
+        data = dict(row)
+        conn.close()
+
+    return {
+        "symbol": sym,
+        "state": data,
+        "deliveries": deliveries,
+        "server_time_utc": now_utc_iso()
+    }
