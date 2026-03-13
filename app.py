@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
@@ -9,7 +10,15 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.1.0")
+app = FastAPI(title="Signal Agent API", version="3.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------------------------
 # CONFIG
@@ -21,7 +30,6 @@ SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "1800"))
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
-# Login / JWT
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 APP_USERNAME = os.getenv("APP_USERNAME", "admin")
@@ -487,14 +495,11 @@ def tv(signal: TVSignal) -> dict[str, Any]:
             tv_ts or None,
             phash,
             updated_utc,
-
             (now + timedelta(minutes=SYMBOL_COOLDOWN_MIN)).isoformat(),
-
             tv_id or None,
             tv_ts or None,
             action,
             phash,
-
             updated_utc,
             symbol
         ))
@@ -516,7 +521,7 @@ def tv(signal: TVSignal) -> dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# LATEST - every account can fetch the same active signal
+# LATEST
 # -------------------------------------------------------------------
 @app.get("/latest")
 def latest(
@@ -585,7 +590,7 @@ def latest(
 
 
 # -------------------------------------------------------------------
-# ACK - each account+magic ACKs once per active signal
+# ACK
 # -------------------------------------------------------------------
 @app.post("/ack")
 def ack(
