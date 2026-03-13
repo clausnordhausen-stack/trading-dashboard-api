@@ -10,7 +10,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.3.0")
+app = FastAPI(title="Signal Agent API", version="3.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -785,6 +785,44 @@ def risk_history(limit: int = 20) -> dict[str, Any]:
                 "magic": r["magic"],
                 "entry_price": r["entry_price"],
                 "sl": r["sl"],
+            }
+            for r in rows
+        ]
+    }
+
+
+# -------------------------------------------------------------------
+# ACCOUNTS OVERVIEW
+# -------------------------------------------------------------------
+@app.get("/accounts/overview")
+def accounts_overview() -> dict[str, Any]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        SELECT
+            account,
+            COUNT(*) AS risk_event_count,
+            MAX(created_utc) AS last_event_utc,
+            ROUND(COALESCE(SUM(risk_usd), 0), 2) AS total_risk_usd
+        FROM risk_events
+        WHERE account IS NOT NULL
+        AND TRIM(account) <> ''
+        GROUP BY account
+        ORDER BY last_event_utc DESC
+        """)
+
+        rows = cur.fetchall()
+        conn.close()
+
+    return {
+        "accounts": [
+            {
+                "account": r["account"],
+                "risk_event_count": r["risk_event_count"],
+                "last_event_utc": r["last_event_utc"],
+                "total_risk_usd": r["total_risk_usd"],
             }
             for r in rows
         ]
