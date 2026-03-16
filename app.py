@@ -10,7 +10,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.5.0")
+app = FastAPI(title="Signal Agent API", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,6 +87,17 @@ class HeartbeatPing(BaseModel):
     status: Optional[str] = None
 
 
+class ControlActionRequest(BaseModel):
+    symbol: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ControlRiskFactorRequest(BaseModel):
+    symbol: Optional[str] = None
+    risk_factor: float
+    note: Optional[str] = None
+
+
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
@@ -149,6 +160,11 @@ def heartbeat_age_sec(last_seen_utc: Optional[str]) -> Optional[int]:
     return max(0, int((now_utc_dt() - dt).total_seconds()))
 
 
+def control_scope_key(symbol: Optional[str]) -> str:
+    sym = norm_symbol(symbol or "")
+    return "GLOBAL" if not sym else sym
+
+
 # -------------------------------------------------------------------
 # LOGIN / JWT HELPERS
 # -------------------------------------------------------------------
@@ -187,6 +203,25 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_control_row(conn: sqlite3.Connection, scope_key: str) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO control_state (
+            scope_key,
+            pause_new_trades,
+            risk_factor,
+            updated_utc,
+            updated_by,
+            note
+        ) VALUES (?, 0, 1.0, ?, ?, ?)
+    """, (scope_key, now_utc_iso(), "system", "auto-init"))
+    conn.commit()
+
+    cur.execute("SELECT * FROM control_state WHERE scope_key = ?", (scope_key,))
+    row = cur.fetchone()
+    return row
 
 
 def init_db() -> None:
@@ -279,7 +314,23 @@ def init_db() -> None:
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS control_state (
+            scope_key TEXT PRIMARY KEY,
+            pause_new_trades INTEGER NOT NULL DEFAULT 0,
+            risk_factor REAL NOT NULL DEFAULT 1.0,
+            updated_utc TEXT NOT NULL,
+            updated_by TEXT,
+            note TEXT
+        )
+        """)
+
         conn.commit()
+
+        ensure_control_row(conn, "GLOBAL")
+        ensure_control_row(conn, "XAUUSD")
+        ensure_control_row(conn, "BTCUSD")
+
         conn.close()
 
 
@@ -404,6 +455,51 @@ def ensure_delivery_row(
         WHERE symbol = ? AND updated_utc = ? AND account = ? AND magic = ?
     """, (symbol, updated_utc, account, magic))
     return cur.fetchone()
+
+
+def get_control_state_payload(conn: sqlite3.Connection, symbol: Optional[str]) -> dict[str, Any]:
+    global_row = ensure_control_row(conn, "GLOBAL")
+    sym = norm_symbol(symbol or "")
+    symbol_row = ensure_control_row(conn, sym) if sym else None
+
+    global_pause = int(global_row["pause_new_trades"]) == 1
+    global_rf = float(global_row["risk_factor"])
+
+    symbol_pause = False
+    symbol_rf = 1.0
+
+    if symbol_row is not None:
+        symbol_pause = int(symbol_row["pause_new_trades"]) == 1
+        symbol_rf = float(symbol_row["risk_factor"])
+
+    effective_pause = global_pause or symbol_pause
+    effective_rf = min(global_rf, symbol_rf) if symbol_row is not None else global_rf
+
+    return {
+        "symbol": sym or None,
+        "global": {
+            "scope_key": global_row["scope_key"],
+            "pause_new_trades": global_pause,
+            "risk_factor": global_rf,
+            "updated_utc": global_row["updated_utc"],
+            "updated_by": global_row["updated_by"],
+            "note": global_row["note"],
+        },
+        "symbol_control": None if symbol_row is None else {
+            "scope_key": symbol_row["scope_key"],
+            "pause_new_trades": symbol_pause,
+            "risk_factor": symbol_rf,
+            "updated_utc": symbol_row["updated_utc"],
+            "updated_by": symbol_row["updated_by"],
+            "note": symbol_row["note"],
+        },
+        "effective": {
+            "pause_new_trades": effective_pause,
+            "risk_factor": effective_rf,
+        },
+        "effective_pause_new_trades": effective_pause,
+        "effective_risk_factor": effective_rf,
+    }
 
 
 # -------------------------------------------------------------------
@@ -913,6 +1009,139 @@ def heartbeat_overview() -> dict[str, Any]:
     return {
         "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
         "items": items
+    }
+
+
+# -------------------------------------------------------------------
+# CONTROL STATE
+# -------------------------------------------------------------------
+@app.get("/control/state")
+def control_state(symbol: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    with DB_LOCK:
+        conn = get_conn()
+        payload = get_control_state_payload(conn, symbol)
+        conn.close()
+    return payload
+
+
+@app.post("/control/pause")
+def control_pause(
+    data: ControlActionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    scope_key = control_scope_key(data.symbol)
+
+    with DB_LOCK:
+        conn = get_conn()
+        ensure_control_row(conn, scope_key)
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE control_state
+            SET
+                pause_new_trades = 1,
+                updated_utc = ?,
+                updated_by = ?,
+                note = ?
+            WHERE scope_key = ?
+        """, (
+            now_utc_iso(),
+            current_user.username,
+            data.note or "paused via app",
+            scope_key
+        ))
+        conn.commit()
+
+        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
+        conn.close()
+
+    return {
+        "status": "ok",
+        "action": "pause",
+        "scope_key": scope_key,
+        "control": payload
+    }
+
+
+@app.post("/control/resume")
+def control_resume(
+    data: ControlActionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    scope_key = control_scope_key(data.symbol)
+
+    with DB_LOCK:
+        conn = get_conn()
+        ensure_control_row(conn, scope_key)
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE control_state
+            SET
+                pause_new_trades = 0,
+                updated_utc = ?,
+                updated_by = ?,
+                note = ?
+            WHERE scope_key = ?
+        """, (
+            now_utc_iso(),
+            current_user.username,
+            data.note or "resumed via app",
+            scope_key
+        ))
+        conn.commit()
+
+        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
+        conn.close()
+
+    return {
+        "status": "ok",
+        "action": "resume",
+        "scope_key": scope_key,
+        "control": payload
+    }
+
+
+@app.post("/control/risk_factor")
+def control_risk_factor(
+    data: ControlRiskFactorRequest,
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    if data.risk_factor <= 0 or data.risk_factor > 1.0:
+        raise HTTPException(status_code=400, detail="risk_factor must be > 0 and <= 1.0")
+
+    scope_key = control_scope_key(data.symbol)
+
+    with DB_LOCK:
+        conn = get_conn()
+        ensure_control_row(conn, scope_key)
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE control_state
+            SET
+                risk_factor = ?,
+                updated_utc = ?,
+                updated_by = ?,
+                note = ?
+            WHERE scope_key = ?
+        """, (
+            float(data.risk_factor),
+            now_utc_iso(),
+            current_user.username,
+            data.note or "risk factor updated via app",
+            scope_key
+        ))
+        conn.commit()
+
+        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
+        conn.close()
+
+    return {
+        "status": "ok",
+        "action": "risk_factor",
+        "scope_key": scope_key,
+        "control": payload
     }
 
 
