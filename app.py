@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Optional
 
 app = FastAPI()
 
@@ -18,7 +19,7 @@ class Signal(BaseModel):
     symbol: str
     side: str
     price: float
-    timestamp: str | None = None
+    timestamp: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -45,20 +46,23 @@ def health():
 
 @app.post("/login")
 async def login(data: LoginRequest):
-    if data.email == "test@test.com" and data.password == "123456":
+    email = data.email.strip()
+    password = data.password.strip()
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    if email == "test@test.com" and password == "123456":
         return {
             "success": True,
             "token": "demo_token_123",
             "user": {
                 "id": "1",
-                "email": data.email
+                "email": email
             }
         }
 
-    return {
-        "success": False,
-        "message": "Invalid email or password"
-    }
+    raise HTTPException(status_code=401, detail="Invalid email or password")
 
 
 @app.post("/signal")
