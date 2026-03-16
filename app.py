@@ -5,7 +5,6 @@ from datetime import datetime
 
 app = FastAPI()
 
-# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,9 +13,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Models
-# -----------------------------
 
 class Signal(BaseModel):
     symbol: str
@@ -25,38 +21,48 @@ class Signal(BaseModel):
     timestamp: str | None = None
 
 
-# -----------------------------
-# Root endpoint
-# -----------------------------
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 
 @app.get("/")
 def root():
     return {
         "status": "running",
         "service": "signal-agent-api",
-        "timestamp": datetime.utcnow()
+        "timestamp": datetime.utcnow().isoformat()
     }
 
-
-# -----------------------------
-# Health check
-# -----------------------------
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "time": datetime.utcnow()
+        "time": datetime.utcnow().isoformat()
     }
 
 
-# -----------------------------
-# Receive trading signals
-# -----------------------------
+@app.post("/login")
+async def login(data: LoginRequest):
+    if data.email == "test@test.com" and data.password == "123456":
+        return {
+            "success": True,
+            "token": "demo_token_123",
+            "user": {
+                "id": "1",
+                "email": data.email
+            }
+        }
+
+    return {
+        "success": False,
+        "message": "Invalid email or password"
+    }
+
 
 @app.post("/signal")
 async def receive_signal(signal: Signal):
-
     print("----- SIGNAL RECEIVED -----")
     print(f"Symbol: {signal.symbol}")
     print(f"Side: {signal.side}")
@@ -71,13 +77,8 @@ async def receive_signal(signal: Signal):
     }
 
 
-# -----------------------------
-# Generic webhook endpoint
-# -----------------------------
-
 @app.post("/webhook")
 async def webhook(request: Request):
-
     data = await request.json()
 
     print("----- WEBHOOK RECEIVED -----")
