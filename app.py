@@ -10,7 +10,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.4.0")
+app = FastAPI(title="Signal Agent API", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +29,7 @@ DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "1800"))
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
@@ -76,6 +77,16 @@ class UserResponse(BaseModel):
     username: str
 
 
+class HeartbeatPing(BaseModel):
+    key: str
+    symbol: str
+    account: Optional[str] = None
+    magic: Optional[str] = None
+    ea_name: Optional[str] = None
+    version: Optional[str] = None
+    status: Optional[str] = None
+
+
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
@@ -121,6 +132,21 @@ def norm_action(a: str) -> str:
 def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
     raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def is_heartbeat_connected(last_seen_utc: Optional[str]) -> bool:
+    dt = parse_iso(last_seen_utc)
+    if dt is None:
+        return False
+    age = int((now_utc_dt() - dt).total_seconds())
+    return age <= HEARTBEAT_TIMEOUT_SEC
+
+
+def heartbeat_age_sec(last_seen_utc: Optional[str]) -> Optional[int]:
+    dt = parse_iso(last_seen_utc)
+    if dt is None:
+        return None
+    return max(0, int((now_utc_dt() - dt).total_seconds()))
 
 
 # -------------------------------------------------------------------
@@ -234,6 +260,22 @@ def init_db() -> None:
             lots REAL,
             risk_usd REAL,
             source TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ea_heartbeat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            account TEXT,
+            magic TEXT,
+            ea_name TEXT,
+            version TEXT,
+            status TEXT,
+            first_seen_utc TEXT NOT NULL,
+            last_seen_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            UNIQUE(symbol, account, magic)
         )
         """)
 
@@ -374,7 +416,8 @@ def root() -> dict[str, Any]:
         "mode": "multi_account_broadcast",
         "login_enabled": True,
         "cooldown_min": SYMBOL_COOLDOWN_MIN,
-        "signal_ttl_sec": SIGNAL_TTL_SEC
+        "signal_ttl_sec": SIGNAL_TTL_SEC,
+        "heartbeat_timeout_sec": HEARTBEAT_TIMEOUT_SEC
     }
 
 
@@ -716,6 +759,161 @@ def risk(event: RiskEvent) -> dict[str, Any]:
         conn.close()
 
     return {"status": "ok"}
+
+
+# -------------------------------------------------------------------
+# HEARTBEAT
+# -------------------------------------------------------------------
+@app.post("/heartbeat")
+def heartbeat(ping: HeartbeatPing) -> dict[str, Any]:
+    if ping.key != SECRET_KEY:
+        raise HTTPException(status_code=401, detail="invalid key")
+
+    sym = norm_symbol(ping.symbol)
+    acc = (ping.account or "").strip()
+    mag = (ping.magic or "").strip()
+    ea_name = (ping.ea_name or "").strip() or None
+    version = (ping.version or "").strip() or None
+    hb_status = (ping.status or "").strip() or "running"
+
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
+
+    now_iso = now_utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT OR IGNORE INTO ea_heartbeat (
+                symbol, account, magic, ea_name, version, status,
+                first_seen_utc, last_seen_utc, updated_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            sym, acc, mag, ea_name, version, hb_status,
+            now_iso, now_iso, now_iso
+        ))
+        conn.commit()
+
+        cur.execute("""
+            UPDATE ea_heartbeat
+            SET
+                ea_name = COALESCE(?, ea_name),
+                version = COALESCE(?, version),
+                status = ?,
+                last_seen_utc = ?,
+                updated_utc = ?
+            WHERE symbol = ? AND account = ? AND magic = ?
+        """, (
+            ea_name,
+            version,
+            hb_status,
+            now_iso,
+            now_iso,
+            sym,
+            acc,
+            mag
+        ))
+        conn.commit()
+
+        conn.close()
+
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "account": acc,
+        "magic": mag,
+        "last_seen_utc": now_iso
+    }
+
+
+@app.get("/heartbeat/status")
+def heartbeat_status(symbol: str) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, account, magic, ea_name, version, status, last_seen_utc
+            FROM ea_heartbeat
+            WHERE symbol = ?
+            ORDER BY last_seen_utc DESC
+            LIMIT 1
+        """, (sym,))
+        row = cur.fetchone()
+        conn.close()
+
+    if row is None:
+        return {
+            "symbol": sym,
+            "connected": False,
+            "last_seen_utc": None,
+            "age_sec": None,
+            "account": None,
+            "magic": None,
+            "ea_name": None,
+            "version": None,
+            "status": "offline",
+            "timeout_sec": HEARTBEAT_TIMEOUT_SEC
+        }
+
+    last_seen = row["last_seen_utc"]
+    connected = is_heartbeat_connected(last_seen)
+
+    return {
+        "symbol": sym,
+        "connected": connected,
+        "last_seen_utc": last_seen,
+        "age_sec": heartbeat_age_sec(last_seen),
+        "account": row["account"],
+        "magic": row["magic"],
+        "ea_name": row["ea_name"],
+        "version": row["version"],
+        "status": row["status"] if connected else "offline",
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC
+    }
+
+
+@app.get("/heartbeat/overview")
+def heartbeat_overview() -> dict[str, Any]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, account, magic, ea_name, version, status, last_seen_utc
+            FROM ea_heartbeat
+            ORDER BY symbol, last_seen_utc DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+    items = []
+    for r in rows:
+        last_seen = r["last_seen_utc"]
+        items.append({
+            "symbol": r["symbol"],
+            "account": r["account"],
+            "magic": r["magic"],
+            "ea_name": r["ea_name"],
+            "version": r["version"],
+            "last_seen_utc": last_seen,
+            "age_sec": heartbeat_age_sec(last_seen),
+            "connected": is_heartbeat_connected(last_seen),
+            "status": r["status"] if is_heartbeat_connected(last_seen) else "offline",
+        })
+
+    return {
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "items": items
+    }
 
 
 # -------------------------------------------------------------------
