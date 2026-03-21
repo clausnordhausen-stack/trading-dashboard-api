@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="6.1.0")
+app = FastAPI(title="Signal Agent API", version="6.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,6 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
@@ -30,15 +33,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 APP_USERNAME = os.getenv("APP_USERNAME", "admin")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
 
+# Optional app token protection for dashboard routes
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 APP_TOKEN_HEADER = os.getenv("APP_TOKEN_HEADER", "X-APP-TOKEN").strip() or "X-APP-TOKEN"
 
+# TV/API key
 TV_API_KEY = os.getenv("TV_API_KEY", SECRET_KEY)
 
+# Controls / manual overrides
 DEFAULT_ALLOW_NEW_ENTRIES = os.getenv("DEFAULT_ALLOW_NEW_ENTRIES", "true").lower() == "true"
 DEFAULT_RISK_MULTIPLIER = float(os.getenv("DEFAULT_RISK_MULTIPLIER", "1.0"))
 DEFAULT_PAUSED = os.getenv("DEFAULT_PAUSED", "false").lower() == "true"
 
+# KPI CONFIG
 DEFAULT_KPI_LOOKBACK_DAYS = int(os.getenv("DEFAULT_KPI_LOOKBACK_DAYS", "7"))
 DEFAULT_KPI_LIMIT_TRADES = int(os.getenv("DEFAULT_KPI_LIMIT_TRADES", "50"))
 
@@ -60,6 +67,9 @@ DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -126,20 +136,27 @@ def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = decode_token(token)
     username = payload.get("sub")
     if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
     return {"username": username}
 
 
 def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
-    if APP_TOKEN and x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid app token")
+    if APP_TOKEN:
+        if x_app_token != APP_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid app token")
     return True
 
 
@@ -153,6 +170,9 @@ def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+# -------------------------------------------------------------------
+# DB INIT
+# -------------------------------------------------------------------
 def init_db():
     with DB_LOCK:
         conn = get_conn()
@@ -242,6 +262,9 @@ def init_db():
 init_db()
 
 
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -311,16 +334,31 @@ class RiskIn(BaseModel):
     value: Optional[float] = None
 
 
+# -------------------------------------------------------------------
+# BASIC ROUTES
+# -------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Signal Agent API", "version": "6.1.0", "server_time_utc": utc_iso()}
+    return {
+        "ok": True,
+        "service": "Signal Agent API",
+        "version": "6.2.0",
+        "server_time_utc": utc_iso()
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "signal-agent-api", "time": utc_iso()}
+    return {
+        "status": "ok",
+        "service": "signal-agent-api",
+        "time": utc_iso()
+    }
 
 
+# -------------------------------------------------------------------
+# AUTH ROUTES
+# -------------------------------------------------------------------
 @app.post("/login", response_model=TokenResponse)
 def login(data: LoginRequest):
     username = data.username.strip()
@@ -330,7 +368,10 @@ def login(data: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     access_token = create_access_token({"sub": username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 
 
 @app.get("/me", response_model=UserResponse)
@@ -338,6 +379,9 @@ def me(current_user: dict = Depends(get_current_user)):
     return {"username": current_user["username"]}
 
 
+# -------------------------------------------------------------------
+# SIGNAL ROUTES
+# -------------------------------------------------------------------
 @app.post("/tv")
 def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
     if x_api_key != TV_API_KEY:
@@ -351,15 +395,23 @@ def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None))
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
         VALUES (?, ?, ?, ?, ?, 'pending')
         """, (symbol, side, payload_json, now, now))
+
         signal_id = cur.lastrowid
         conn.commit()
         conn.close()
 
-    return {"ok": True, "signal_id": signal_id, "symbol": symbol, "side": side, "created_utc": now}
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "created_utc": now
+    }
 
 
 @app.post("/ack")
@@ -370,6 +422,7 @@ def ack_signal(data: AckIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         SELECT *
         FROM signals
@@ -386,14 +439,22 @@ def ack_signal(data: AckIn):
             raise HTTPException(status_code=404, detail="Signal not found")
 
         signal_id = row["id"]
+
         cur.execute("""
         INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc)
         VALUES (?, ?, ?, ?, ?)
         """, (signal_id, symbol, account, data.magic, utc_iso()))
+
         conn.commit()
         conn.close()
 
-    return {"ok": True, "signal_id": signal_id, "symbol": symbol, "account": account, "magic": data.magic}
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "account": account,
+        "magic": data.magic
+    }
 
 
 @app.post("/hb")
@@ -404,13 +465,21 @@ def heartbeat(data: HeartbeatPing):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            data.account, data.magic, data.symbol.upper(), data.ea_name,
-            data.version, utc_iso(), data.status, data.comment
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.ea_name,
+            data.version,
+            utc_iso(),
+            data.status,
+            data.comment
         ))
+
         conn.commit()
         conn.close()
 
@@ -425,10 +494,21 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         if symbol_norm:
-            cur.execute("SELECT * FROM heartbeats WHERE symbol = ? ORDER BY id DESC LIMIT 200", (symbol_norm,))
+            cur.execute("""
+            SELECT * FROM heartbeats
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 200
+            """, (symbol_norm,))
         else:
-            cur.execute("SELECT * FROM heartbeats ORDER BY id DESC LIMIT 500")
+            cur.execute("""
+            SELECT * FROM heartbeats
+            ORDER BY id DESC
+            LIMIT 500
+            """)
+
         rows = cur.fetchall()
         conn.close()
 
@@ -440,11 +520,13 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
 
     result = []
     connected_count = 0
+
     for _, r in latest_map.items():
         last_seen = parse_dt(r["last_seen_utc"])
         connected = bool(last_seen and last_seen >= cutoff)
         if connected:
             connected_count += 1
+
         result.append({
             "account": r.get("account"),
             "magic": r.get("magic"),
@@ -457,9 +539,17 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
             "comment": r.get("comment"),
         })
 
-    return {"ok": True, "timeout_sec": HEARTBEAT_TIMEOUT_SEC, "connected_count": connected_count, "items": result}
+    return {
+        "ok": True,
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "connected_count": connected_count,
+        "items": result
+    }
 
 
+# -------------------------------------------------------------------
+# DEALS + RISKS
+# -------------------------------------------------------------------
 @app.post("/deal")
 def post_deal(data: DealIn):
     deal_time = data.deal_time_utc or utc_iso()
@@ -467,6 +557,7 @@ def post_deal(data: DealIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO deals(
             account, magic, symbol, side, ticket, volume,
@@ -477,12 +568,27 @@ def post_deal(data: DealIn):
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            data.account, data.magic, data.symbol.upper(), data.side, data.ticket, data.volume,
-            data.entry_price, data.exit_price, data.sl, data.tp,
-            data.pnl, data.pnl_currency, data.commission, data.swap,
-            data.risk_amount, data.r_multiple, data.strategy,
-            deal_time, utc_iso()
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.side,
+            data.ticket,
+            data.volume,
+            data.entry_price,
+            data.exit_price,
+            data.sl,
+            data.tp,
+            data.pnl,
+            data.pnl_currency,
+            data.commission,
+            data.swap,
+            data.risk_amount,
+            data.r_multiple,
+            data.strategy,
+            deal_time,
+            utc_iso()
         ))
+
         conn.commit()
         conn.close()
 
@@ -494,30 +600,54 @@ def post_risk(data: RiskIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            data.account, data.magic, data.symbol.upper(), data.event_type,
-            data.level, data.message, data.value, utc_iso()
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.event_type,
+            data.level,
+            data.message,
+            data.value,
+            utc_iso()
         ))
+
         conn.commit()
         conn.close()
 
     return {"ok": True}
 
 
-def get_deals_filtered(symbol=None, account=None, magic=None, lookback_days=DEFAULT_KPI_LOOKBACK_DAYS, limit_trades=DEFAULT_KPI_LIMIT_TRADES):
+# -------------------------------------------------------------------
+# KPI CORE
+# -------------------------------------------------------------------
+def get_deals_filtered(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+):
     dt_from = now_utc() - timedelta(days=lookback_days)
-    query = "SELECT * FROM deals WHERE deal_time_utc >= ?"
+
+    query = """
+    SELECT *
+    FROM deals
+    WHERE deal_time_utc >= ?
+    """
     params = [utc_iso(dt_from)]
 
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
+
     if account:
         query += " AND account = ?"
         params.append(account)
+
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -532,19 +662,21 @@ def get_deals_filtered(symbol=None, account=None, magic=None, lookback_days=DEFA
         rows = cur.fetchall()
         conn.close()
 
-    return list(reversed(rows))
+    rows = list(reversed(rows))
+    return rows
 
 
-def calc_equity_curve_from_pnl(rows):
+def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
     curve = [0.0]
     running = 0.0
     for r in rows:
-        running += safe_float(r.get("pnl"), 0.0)
+        pnl = safe_float(r.get("pnl"), 0.0)
+        running += pnl
         curve.append(running)
     return curve
 
 
-def calc_max_drawdown_abs(curve):
+def calc_max_drawdown_abs(curve: List[float]) -> float:
     peak = -10**18
     max_dd = 0.0
     for x in curve:
@@ -556,7 +688,7 @@ def calc_max_drawdown_abs(curve):
     return max_dd
 
 
-def calc_max_drawdown_pct(curve):
+def calc_max_drawdown_pct(curve: List[float]) -> float:
     peak = None
     max_dd_pct = 0.0
     for x in curve:
@@ -564,11 +696,12 @@ def calc_max_drawdown_pct(curve):
             peak = x
         if peak and peak > 0:
             dd_pct = ((peak - x) / peak) * 100.0
-            max_dd_pct = max(max_dd_pct, dd_pct)
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
     return max_dd_pct
 
 
-def calc_loss_streak(rows):
+def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     max_streak = 0
     for r in rows:
@@ -581,7 +714,7 @@ def calc_loss_streak(rows):
     return max_streak
 
 
-def calc_current_loss_streak(rows):
+def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     for r in reversed(rows):
         pnl = safe_float(r.get("pnl"), 0.0)
@@ -592,10 +725,16 @@ def calc_current_loss_streak(rows):
     return streak
 
 
-def summarize_kpis(rows):
+def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_trades = len(rows)
-    wins = losses = breakeven = 0
-    gross_profit = gross_loss = net_pnl = total_r = 0.0
+    wins = 0
+    losses = 0
+    breakeven = 0
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    net_pnl = 0.0
+    total_r = 0.0
 
     for r in rows:
         pnl = safe_float(r.get("pnl"), 0.0)
@@ -613,12 +752,18 @@ def summarize_kpis(rows):
         else:
             breakeven += 1
 
-    winrate = (wins / total_trades * 100.0) if total_trades else 0.0
-    avg_pnl = (net_pnl / total_trades) if total_trades else 0.0
-    avg_r = (total_r / total_trades) if total_trades else 0.0
+    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    avg_pnl = (net_pnl / total_trades) if total_trades > 0 else 0.0
+    avg_r = (total_r / total_trades) if total_trades > 0 else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
 
     curve = calc_equity_curve_from_pnl(rows)
+    max_dd_abs = calc_max_drawdown_abs(curve)
+    max_dd_pct = calc_max_drawdown_pct(curve)
+    max_loss_streak = calc_loss_streak(rows)
+    current_loss_streak = calc_current_loss_streak(rows)
+
+    last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
         "total_trades": total_trades,
@@ -633,15 +778,15 @@ def summarize_kpis(rows):
         "sum_r": round(total_r, 2),
         "avg_r": round(avg_r, 2),
         "profit_factor": round(profit_factor, 2),
-        "max_drawdown_abs": round(calc_max_drawdown_abs(curve), 2),
-        "max_drawdown_pct": round(calc_max_drawdown_pct(curve), 2),
-        "max_loss_streak": calc_loss_streak(rows),
-        "current_loss_streak": calc_current_loss_streak(rows),
-        "last_trade_time_utc": rows[-1]["deal_time_utc"] if total_trades > 0 else None,
+        "max_drawdown_abs": round(max_dd_abs, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "max_loss_streak": max_loss_streak,
+        "current_loss_streak": current_loss_streak,
+        "last_trade_time_utc": last_trade_time,
     }
 
 
-def auto_gate_from_kpis(kpi):
+def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
     if not AUTO_GATE_ENABLED:
         return {
             "gate_level": DEFAULT_GATE_LEVEL,
@@ -661,34 +806,88 @@ def auto_gate_from_kpis(kpi):
 
     if dd_pct >= RED_DD_PCT:
         reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
+
     if cur_loss_streak >= RED_LOSS_STREAK:
         reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
+
     if sum_r <= RED_R_SUM:
         reasons_red.append(f"SUM_R<={RED_R_SUM}")
+
     if total_trades >= 5 and winrate < RED_WINRATE_MIN:
         reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
 
     if reasons_red:
-        return {"gate_level": "RED", "allow_new_entries": False, "risk_multiplier": 0.0, "reasons": reasons_red}
+        return {
+            "gate_level": "RED",
+            "allow_new_entries": False,
+            "risk_multiplier": 0.0,
+            "reasons": reasons_red
+        }
 
     if dd_pct >= YELLOW_DD_PCT:
         reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
+
     if cur_loss_streak >= YELLOW_LOSS_STREAK:
         reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
+
     if sum_r <= YELLOW_R_SUM:
         reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
+
     if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
         reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
 
     if reasons_yellow:
-        return {"gate_level": "YELLOW", "allow_new_entries": True, "risk_multiplier": 0.5, "reasons": reasons_yellow}
+        return {
+            "gate_level": "YELLOW",
+            "allow_new_entries": True,
+            "risk_multiplier": 0.5,
+            "reasons": reasons_yellow
+        }
 
-    return {"gate_level": "GREEN", "allow_new_entries": True, "risk_multiplier": 1.0, "reasons": ["NORMAL"]}
+    return {
+        "gate_level": "GREEN",
+        "allow_new_entries": True,
+        "risk_multiplier": 1.0,
+        "reasons": ["NORMAL"]
+    }
 
 
+def compute_auto_gate(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+) -> Dict[str, Any]:
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+    gate = auto_gate_from_kpis(kpis)
+
+    return {
+        "kpis": kpis,
+        "gate": gate
+    }
+
+
+# -------------------------------------------------------------------
+# CONTROLS + GATES
+# -------------------------------------------------------------------
 @app.get("/controls/effective")
-def controls_effective(symbol: Optional[str] = Query(default=None), _: bool = Depends(app_token_guard)):
-    return {"ok": True, "controls": get_runtime_controls(symbol)}
+def controls_effective(
+    symbol: Optional[str] = Query(default=None),
+    _: bool = Depends(app_token_guard)
+):
+    return {
+        "ok": True,
+        "controls": get_runtime_controls(symbol)
+    }
 
 
 @app.get("/status/gate_auto")
@@ -699,9 +898,13 @@ def gate_auto(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    rows = get_deals_filtered(symbol, account, magic, lookback_days, limit_trades)
-    kpis = summarize_kpis(rows)
-    gate = auto_gate_from_kpis(kpis)
+    result = compute_auto_gate(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
 
     return {
         "ok": True,
@@ -712,8 +915,8 @@ def gate_auto(
             "lookback_days": lookback_days,
             "limit_trades": limit_trades,
         },
-        "kpis": kpis,
-        "gate": gate
+        "kpis": result["kpis"],
+        "gate": result["gate"]
     }
 
 
@@ -724,7 +927,7 @@ def gate_combo(
     magic: Optional[str] = Query(default=None),
 ):
     controls = get_runtime_controls(symbol)
-    auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
+    auto_payload = compute_auto_gate(symbol=symbol, account=account, magic=magic)
     auto_gate = auto_payload["gate"]
 
     paused = bool(controls["paused"])
@@ -734,7 +937,9 @@ def gate_combo(
     allow_new_entries = (not paused) and controls_allow and auto_allow
     final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
 
-    gate_level = "RED" if paused else auto_gate["gate_level"]
+    gate_level = auto_gate["gate_level"]
+    if paused:
+        gate_level = "RED"
 
     reasons = []
     if paused:
@@ -756,6 +961,9 @@ def gate_combo(
     }
 
 
+# -------------------------------------------------------------------
+# KPI ENDPOINTS
+# -------------------------------------------------------------------
 @app.get("/kpis/rolling")
 def rolling_kpis(
     symbol: Optional[str] = Query(default=None),
@@ -764,7 +972,14 @@ def rolling_kpis(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    rows = get_deals_filtered(symbol, account, magic, lookback_days, limit_trades)
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
     kpis = summarize_kpis(rows)
 
     return {
@@ -788,14 +1003,25 @@ def system_overview(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    rows = get_deals_filtered(symbol, account, magic, lookback_days, limit_trades)
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
     kpis = summarize_kpis(rows)
     gate = gate_combo(symbol=symbol, account=account, magic=magic)
 
+    heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
-        heartbeat_payload = heartbeat_status(symbol=symbol) if symbol else heartbeat_status()
+        if symbol:
+            heartbeat_payload = heartbeat_status(symbol=symbol)
+        else:
+            heartbeat_payload = heartbeat_status()
     except Exception:
-        heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
+        pass
 
     return {
         "ok": True,
@@ -839,6 +1065,7 @@ def latest_signal(
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         SELECT s.*
         FROM signals s
@@ -853,6 +1080,7 @@ def latest_signal(
         ORDER BY s.id DESC
         LIMIT 1
         """, (symbol, account, magic))
+
         row = cur.fetchone()
         conn.close()
 
