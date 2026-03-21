@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="6.2.0")
+app = FastAPI(title="Signal Agent API", version="6.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -170,6 +170,15 @@ def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def normalize_side(value: Optional[str]) -> str:
+    s = (value or "").strip().upper()
+    if s == "LONG":
+        s = "BUY"
+    elif s == "SHORT":
+        s = "SELL"
+    return s
+
+
 # -------------------------------------------------------------------
 # DB INIT
 # -------------------------------------------------------------------
@@ -280,8 +289,10 @@ class UserResponse(BaseModel):
 
 
 class TVSignalIn(BaseModel):
+    key: Optional[str] = None
     symbol: str
     side: Optional[str] = None
+    action: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -342,7 +353,7 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "6.2.0",
+        "version": "6.3.0",
         "server_time_utc": utc_iso()
     }
 
@@ -383,12 +394,20 @@ def me(current_user: dict = Depends(get_current_user)):
 # SIGNAL ROUTES
 # -------------------------------------------------------------------
 @app.post("/tv")
-def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
-    if x_api_key != TV_API_KEY:
+def tv_signal(
+    data: TVSignalIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
+):
+    provided_key = x_api_key or data.key
+    if provided_key != TV_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     symbol = data.symbol.strip().upper()
-    side = (data.side or "").strip().upper()
+    side = normalize_side(data.side or data.action)
+
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail="side/action must be BUY or SELL")
+
     payload_json = json.dumps(data.payload or {}, ensure_ascii=False)
     now = utc_iso()
 
