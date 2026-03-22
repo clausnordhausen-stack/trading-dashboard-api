@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="8.0.0")
+app = FastAPI(title="Signal Agent API", version="9.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +68,15 @@ DAILY_LOSS_CAP_USD = float(os.getenv("DAILY_LOSS_CAP_USD", "250.0"))
 DAILY_R_CAP = float(os.getenv("DAILY_R_CAP", "-5.0"))
 DAILY_MAX_TRADES = int(os.getenv("DAILY_MAX_TRADES", "10"))
 RISK_ENGINE_BLOCK_ON_BREACH = os.getenv("RISK_ENGINE_BLOCK_ON_BREACH", "true").lower() == "true"
+
+# Phase 9 - Execution Intelligence
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dynamic").strip().lower()
+SCORE_TO_RISK_ENABLED = os.getenv("SCORE_TO_RISK_ENABLED", "true").lower() == "true"
+SCORE_LOW_THRESHOLD = float(os.getenv("SCORE_LOW_THRESHOLD", "0.6"))
+SCORE_HIGH_THRESHOLD = float(os.getenv("SCORE_HIGH_THRESHOLD", "0.85"))
+RISK_MULTIPLIER_LOW = float(os.getenv("RISK_MULTIPLIER_LOW", "0.5"))
+RISK_MULTIPLIER_NORMAL = float(os.getenv("RISK_MULTIPLIER_NORMAL", "1.0"))
+RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -416,7 +425,7 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "8.0.0",
+        "version": "9.0.0",
         "server_time_utc": utc_iso()
     }
 
@@ -1077,6 +1086,96 @@ def compute_risk_engine(
 
 
 # -------------------------------------------------------------------
+# PHASE 9 - EXECUTION ENGINE
+# -------------------------------------------------------------------
+def compute_execution_engine(
+    signal_row: Optional[Dict[str, Any]] = None,
+    gate_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = (signal_row or {}).get("payload", {}) or {}
+    score = safe_float(payload.get("score"), 1.0)
+
+    gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
+
+    mode = EXECUTION_MODE
+    reasons = []
+    risk_multiplier = RISK_MULTIPLIER_NORMAL
+    priority = "NORMAL"
+
+    if gate_level == "RED":
+        return {
+            "mode": mode,
+            "score_to_risk_enabled": SCORE_TO_RISK_ENABLED,
+            "score": score,
+            "priority": "BLOCKED",
+            "risk_multiplier": 0.0,
+            "approved": False,
+            "reasons": ["GATE_RED"]
+        }
+
+    if not SCORE_TO_RISK_ENABLED:
+        return {
+            "mode": mode,
+            "score_to_risk_enabled": False,
+            "score": score,
+            "priority": "NORMAL",
+            "risk_multiplier": RISK_MULTIPLIER_NORMAL,
+            "approved": True,
+            "reasons": ["SCORE_TO_RISK_DISABLED"]
+        }
+
+    if mode == "safe":
+        risk_multiplier = min(RISK_MULTIPLIER_LOW, RISK_MULTIPLIER_NORMAL)
+        priority = "LOW"
+        reasons.append("MODE_SAFE")
+
+    elif mode == "normal":
+        risk_multiplier = RISK_MULTIPLIER_NORMAL
+        priority = "NORMAL"
+        reasons.append("MODE_NORMAL")
+
+    elif mode == "aggressive":
+        if score >= SCORE_HIGH_THRESHOLD:
+            risk_multiplier = RISK_MULTIPLIER_HIGH
+            priority = "HIGH"
+            reasons.append("MODE_AGGRESSIVE_HIGH_SCORE")
+        else:
+            risk_multiplier = RISK_MULTIPLIER_NORMAL
+            priority = "NORMAL"
+            reasons.append("MODE_AGGRESSIVE_NORMAL_SCORE")
+
+    else:
+        if score < SCORE_LOW_THRESHOLD:
+            risk_multiplier = RISK_MULTIPLIER_LOW
+            priority = "LOW"
+            reasons.append(f"SCORE<{SCORE_LOW_THRESHOLD}")
+        elif score >= SCORE_HIGH_THRESHOLD:
+            risk_multiplier = RISK_MULTIPLIER_HIGH
+            priority = "HIGH"
+            reasons.append(f"SCORE>={SCORE_HIGH_THRESHOLD}")
+        else:
+            risk_multiplier = RISK_MULTIPLIER_NORMAL
+            priority = "NORMAL"
+            reasons.append("MID_SCORE_RANGE")
+
+        reasons.append("MODE_DYNAMIC")
+
+    if gate_level == "YELLOW":
+        risk_multiplier = min(risk_multiplier, RISK_MULTIPLIER_NORMAL)
+        reasons.append("YELLOW_GATE_CAP")
+
+    return {
+        "mode": mode,
+        "score_to_risk_enabled": SCORE_TO_RISK_ENABLED,
+        "score": round(score, 4),
+        "priority": priority,
+        "risk_multiplier": round(risk_multiplier, 4),
+        "approved": True,
+        "reasons": reasons
+    }
+
+
+# -------------------------------------------------------------------
 # CONTROLS + GATES
 # -------------------------------------------------------------------
 @app.get("/controls/effective")
@@ -1135,6 +1234,32 @@ def status_risk_engine(
             "magic": magic,
         },
         "risk_engine": result
+    }
+
+
+@app.get("/status/execution_engine")
+def status_execution_engine(
+    score: float = Query(default=1.0),
+    gate_level: str = Query(default="GREEN"),
+):
+    dummy_signal = {
+        "payload": {
+            "score": score
+        }
+    }
+    dummy_gate = {
+        "gate_level": gate_level.upper()
+    }
+
+    result = compute_execution_engine(dummy_signal, dummy_gate)
+
+    return {
+        "ok": True,
+        "input": {
+            "score": score,
+            "gate_level": gate_level.upper()
+        },
+        "execution_engine": result
     }
 
 
@@ -1363,11 +1488,33 @@ def latest_signal(
             "gate": gate_payload
         }
 
+    execution_engine = compute_execution_engine(row, gate_payload)
+
+    if not execution_engine["approved"]:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": True,
+            "reason": "EXECUTION_ENGINE_BLOCK",
+            "execution_engine": execution_engine,
+            "symbol": symbol,
+            "controls": controls,
+            "gate": gate_payload
+        }
+
+    effective_risk_multiplier = (
+        safe_float(controls["risk_multiplier"], 1.0)
+        * safe_float(gate_payload.get("risk_multiplier"), 1.0)
+        * safe_float(execution_engine.get("risk_multiplier"), 1.0)
+    )
+
     return {
         "ok": True,
         "has_signal": True,
         "blocked": False,
         "filter": filter_result,
+        "execution_engine": execution_engine,
+        "effective_risk_multiplier": round(effective_risk_multiplier, 4),
         "symbol": symbol,
         "controls": controls,
         "gate": gate_payload,
