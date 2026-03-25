@@ -236,7 +236,9 @@ def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any
 
 
 def expire_old_signals():
-    cutoff = utc_iso(now_utc() - timedelta(seconds=SIGNAL_TTL_SEC))
+    cutoff_dt = now_utc() - timedelta(seconds=SIGNAL_TTL_SEC)
+    cutoff = utc_iso(cutoff_dt)
+
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
@@ -248,6 +250,20 @@ def expire_old_signals():
         """, (cutoff,))
         conn.commit()
         conn.close()
+
+
+def decode_payload_json(payload_json: Optional[str]) -> Dict[str, Any]:
+    try:
+        return json.loads(payload_json or "{}")
+    except Exception:
+        return {}
+
+
+def seconds_since(dt_str: Optional[str]) -> Optional[int]:
+    dt = parse_dt(dt_str)
+    if not dt:
+        return None
+    return int((now_utc() - dt).total_seconds())
 
 
 # -------------------------------------------------------------------
@@ -1395,6 +1411,132 @@ def system_overview(
 
 
 # -------------------------------------------------------------------
+# BUNDLE ENDPOINTS
+# -------------------------------------------------------------------
+@app.get("/bundle/overview")
+def bundle_overview(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "account": account,
+        "magic": magic,
+        "systemOverview": system_overview(symbol=symbol, account=account, magic=magic),
+        "latest": latest_signal(symbol=symbol, account=account, magic=magic),
+        "gateCombo": gate_combo(symbol=symbol, account=account, magic=magic),
+        "riskEngine": status_risk_engine(symbol=symbol, account=account, magic=magic),
+        "heartbeat": heartbeat_status(symbol=symbol),
+    }
+
+
+@app.get("/bundle/alerts")
+def bundle_alerts(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "account": account,
+        "magic": magic,
+        "latest": latest_signal(symbol=symbol, account=account, magic=magic),
+        "gateCombo": gate_combo(symbol=symbol, account=account, magic=magic),
+        "riskEngine": status_risk_engine(symbol=symbol, account=account, magic=magic),
+        "heartbeat": heartbeat_status(symbol=symbol),
+    }
+
+
+@app.get("/bundle/activity")
+def bundle_activity(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "account": account,
+        "magic": magic,
+        "systemOverview": system_overview(
+            symbol=symbol,
+            account=account,
+            magic=magic,
+            lookback_days=lookback_days,
+            limit_trades=limit_trades,
+        ),
+        "latest": latest_signal(symbol=symbol, account=account, magic=magic),
+        "kpis": rolling_kpis(
+            symbol=symbol,
+            account=account,
+            magic=magic,
+            lookback_days=lookback_days,
+            limit_trades=limit_trades,
+        ),
+    }
+
+
+@app.get("/bundle/risk")
+def bundle_risk(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    latest = latest_signal(symbol=symbol, account=account, magic=magic)
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "account": account,
+        "magic": magic,
+        "riskEngine": status_risk_engine(symbol=symbol, account=account, magic=magic),
+        "gateCombo": gate_combo(symbol=symbol, account=account, magic=magic),
+        "latest": latest,
+    }
+
+
+@app.get("/bundle/shell")
+def bundle_shell(
+    account: Optional[str] = Query(default=None),
+    symbols: Optional[str] = Query(default=None),
+):
+    symbol_list = []
+    if symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    if not symbol_list:
+        hb = heartbeat_status()
+        seen = []
+        for item in hb.get("items", []):
+            sym = (item.get("symbol") or "").strip().upper()
+            if sym and sym not in seen:
+                seen.append(sym)
+        symbol_list = seen
+
+    result = []
+    for symbol in symbol_list:
+        hb = heartbeat_status(symbol=symbol)
+        gate = gate_combo(symbol=symbol, account=account, magic=None)
+        result.append({
+            "symbol": symbol,
+            "heartbeat": hb,
+            "gateCombo": gate,
+        })
+
+    return {
+        "ok": True,
+        "account": account,
+        "symbols": symbol_list,
+        "items": result,
+        "server_time_utc": utc_iso(),
+    }
+
+
+# -------------------------------------------------------------------
 # LATEST SIGNAL DELIVERY
 # -------------------------------------------------------------------
 @app.get("/latest")
@@ -1469,10 +1611,7 @@ def latest_signal(
                 "gate": gate_payload
             }
 
-    try:
-        row["payload"] = json.loads(row.get("payload_json") or "{}")
-    except Exception:
-        row["payload"] = {}
+    row["payload"] = decode_payload_json(row.get("payload_json"))
 
     filter_result = signal_passes_filter(row, gate_payload)
 
@@ -1523,304 +1662,232 @@ def latest_signal(
 
 
 # -------------------------------------------------------------------
-# BUNDLE HELPERS
+# DEBUG ENDPOINTS
 # -------------------------------------------------------------------
-def build_overview_bundle(
-    symbol: str,
-    account: str,
-    magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-) -> Dict[str, Any]:
-    symbol = symbol.strip().upper()
-    account = account.strip()
+@app.get("/debug/signals/recent")
+def debug_signals_recent(
+    symbol: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+):
+    expire_old_signals()
 
-    system = system_overview(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
+    symbol_norm = symbol.strip().upper() if symbol else None
 
-    latest = latest_signal(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
 
-    gate = gate_combo(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
+        if symbol_norm:
+            cur.execute("""
+            SELECT *
+            FROM signals
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """, (symbol_norm, limit))
+        else:
+            cur.execute("""
+            SELECT *
+            FROM signals
+            ORDER BY id DESC
+            LIMIT ?
+            """, (limit,))
 
-    risk = status_risk_engine(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    heartbeat = heartbeat_status(symbol=symbol)
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic,
-        "systemOverview": system,
-        "latest": latest,
-        "gateCombo": gate,
-        "riskEngine": risk,
-        "heartbeat": heartbeat,
-    }
-
-
-def build_alerts_bundle(
-    symbol: str,
-    account: str,
-    magic: Optional[str] = None,
-) -> Dict[str, Any]:
-    symbol = symbol.strip().upper()
-    account = account.strip()
-
-    latest = latest_signal(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    gate = gate_combo(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    risk = status_risk_engine(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    heartbeat = heartbeat_status(symbol=symbol)
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic,
-        "latest": latest,
-        "gateCombo": gate,
-        "riskEngine": risk,
-        "heartbeat": heartbeat,
-    }
-
-
-def build_activity_bundle(
-    symbol: str,
-    account: str,
-    magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-) -> Dict[str, Any]:
-    symbol = symbol.strip().upper()
-    account = account.strip()
-
-    system = system_overview(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
-
-    latest = latest_signal(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    kpis = rolling_kpis(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic,
-        "systemOverview": system,
-        "latest": latest,
-        "kpis": kpis,
-    }
-
-
-def build_risk_bundle(
-    symbol: str,
-    account: str,
-    magic: Optional[str] = None,
-) -> Dict[str, Any]:
-    symbol = symbol.strip().upper()
-    account = account.strip()
-
-    risk = status_risk_engine(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    gate = gate_combo(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    latest = latest_signal(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic,
-        "riskEngine": risk,
-        "gateCombo": gate,
-        "latest": latest,
-    }
-
-
-def build_shell_bundle(
-    account: str,
-    symbols: List[str],
-    magic_map: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    account = account.strip()
-    magic_map = magic_map or {}
+        rows = cur.fetchall()
+        conn.close()
 
     items = []
-
-    for raw_symbol in symbols:
-        symbol = raw_symbol.strip().upper()
-        try:
-            heartbeat = heartbeat_status(symbol=symbol)
-            hb_items = heartbeat.get("items", []) or []
-            connected_count = heartbeat.get("connected_count", 0)
-
-            online = bool(hb_items) or (
-                isinstance(connected_count, (int, float)) and connected_count > 0
-            )
-
-            items.append({
-                "symbol": symbol,
-                "magic": magic_map.get(symbol),
-                "status": "ONLINE" if online else "OFFLINE",
-                "connected_count": connected_count,
-                "heartbeat": heartbeat,
-            })
-        except Exception as e:
-            items.append({
-                "symbol": symbol,
-                "magic": magic_map.get(symbol),
-                "status": "ERROR",
-                "connected_count": 0,
-                "error": str(e),
-            })
+    for row in rows:
+        items.append({
+            "id": row["id"],
+            "symbol": row["symbol"],
+            "side": row["side"],
+            "status": row["status"],
+            "created_utc": row["created_utc"],
+            "updated_utc": row["updated_utc"],
+            "age_sec": seconds_since(row.get("created_utc")),
+            "payload": decode_payload_json(row.get("payload_json")),
+        })
 
     return {
         "ok": True,
-        "account": account,
-        "server_time_utc": utc_iso(),
+        "symbol": symbol_norm,
+        "count": len(items),
         "items": items,
+        "server_time_utc": utc_iso(),
     }
 
 
-# -------------------------------------------------------------------
-# BUNDLE ENDPOINTS
-# -------------------------------------------------------------------
-@app.get("/bundle/overview")
-def bundle_overview(
-    symbol: str = Query(...),
-    account: str = Query(...),
+@app.get("/debug/acks/recent")
+def debug_acks_recent(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
     magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+    limit: int = Query(default=50, ge=1, le=500),
 ):
-    return build_overview_bundle(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
+    symbol_norm = symbol.strip().upper() if symbol else None
+
+    query = """
+    SELECT *
+    FROM signal_acks
+    WHERE 1=1
+    """
+    params = []
+
+    if symbol_norm:
+        query += " AND symbol = ?"
+        params.append(symbol_norm)
+
+    if account:
+        query += " AND account = ?"
+        params.append(account)
+
+    if magic is not None:
+        query += " AND COALESCE(magic, '') = COALESCE(?, '')"
+        params.append(magic)
+
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    return {
+        "ok": True,
+        "filters": {
+            "symbol": symbol_norm,
+            "account": account,
+            "magic": magic,
+            "limit": limit,
+        },
+        "count": len(rows),
+        "items": rows,
+        "server_time_utc": utc_iso(),
+    }
 
 
-@app.get("/bundle/alerts")
-def bundle_alerts(
+@app.get("/debug/consumers")
+def debug_consumers(
+    symbol: Optional[str] = Query(default=None),
+):
+    hb = heartbeat_status(symbol=symbol)
+    items = hb.get("items", [])
+
+    consumers = []
+    for item in items:
+        consumers.append({
+            "account": item.get("account"),
+            "magic": item.get("magic"),
+            "symbol": item.get("symbol"),
+            "ea_name": item.get("ea_name"),
+            "version": item.get("version"),
+            "connected": item.get("connected"),
+            "last_seen_utc": item.get("last_seen_utc"),
+            "status": item.get("status"),
+            "comment": item.get("comment"),
+        })
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper() if symbol else None,
+        "connected_count": hb.get("connected_count", 0),
+        "count": len(consumers),
+        "items": consumers,
+        "server_time_utc": utc_iso(),
+    }
+
+
+@app.get("/debug/symbol_state")
+def debug_symbol_state(
     symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
 ):
-    return build_alerts_bundle(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
+    expire_old_signals()
+    symbol_norm = symbol.strip().upper()
 
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
 
-@app.get("/bundle/activity")
-def bundle_activity(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
-):
-    return build_activity_bundle(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
+        cur.execute("""
+        SELECT *
+        FROM signals
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """, (symbol_norm,))
+        latest_signal_row = cur.fetchone()
 
+        cur.execute("""
+        SELECT *
+        FROM signals
+        WHERE symbol = ?
+          AND status = 'pending'
+        ORDER BY id DESC
+        LIMIT 1
+        """, (symbol_norm,))
+        latest_pending_row = cur.fetchone()
 
-@app.get("/bundle/risk")
-def bundle_risk(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    return build_risk_bundle(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-    )
+        cur.execute("""
+        SELECT *
+        FROM signal_acks
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 50
+        """, (symbol_norm,))
+        ack_rows = cur.fetchall()
 
+        conn.close()
 
-@app.get("/bundle/shell")
-def bundle_shell(
-    account: str = Query(...),
-    symbols: str = Query(..., description="Comma separated symbols"),
-    magic_map_json: Optional[str] = Query(default=None),
-):
-    parsed_symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    parsed_magic_map: Dict[str, str] = {}
+    hb = heartbeat_status(symbol=symbol_norm)
 
-    if magic_map_json:
-        try:
-            parsed_magic_map = json.loads(magic_map_json)
-        except Exception:
-            parsed_magic_map = {}
+    latest_signal_payload = None
+    if latest_signal_row:
+        latest_signal_payload = {
+            "id": latest_signal_row["id"],
+            "symbol": latest_signal_row["symbol"],
+            "side": latest_signal_row["side"],
+            "status": latest_signal_row["status"],
+            "created_utc": latest_signal_row["created_utc"],
+            "updated_utc": latest_signal_row["updated_utc"],
+            "age_sec": seconds_since(latest_signal_row.get("created_utc")),
+            "payload": decode_payload_json(latest_signal_row.get("payload_json")),
+        }
 
-    return build_shell_bundle(
-        account=account,
-        symbols=parsed_symbols,
-        magic_map=parsed_magic_map,
-    )
+    latest_pending_payload = None
+    if latest_pending_row:
+        latest_pending_payload = {
+            "id": latest_pending_row["id"],
+            "symbol": latest_pending_row["symbol"],
+            "side": latest_pending_row["side"],
+            "status": latest_pending_row["status"],
+            "created_utc": latest_pending_row["created_utc"],
+            "updated_utc": latest_pending_row["updated_utc"],
+            "age_sec": seconds_since(latest_pending_row.get("created_utc")),
+            "payload": decode_payload_json(latest_pending_row.get("payload_json")),
+        }
+
+    ack_items = []
+    for row in ack_rows:
+        ack_items.append({
+            "id": row["id"],
+            "signal_id": row["signal_id"],
+            "symbol": row["symbol"],
+            "account": row["account"],
+            "magic": row["magic"],
+            "ack_utc": row["ack_utc"],
+            "ack_age_sec": seconds_since(row.get("ack_utc")),
+        })
+
+    return {
+        "ok": True,
+        "symbol": symbol_norm,
+        "latest_signal": latest_signal_payload,
+        "latest_pending_signal": latest_pending_payload,
+        "recent_acks": ack_items,
+        "heartbeat": hb,
+        "server_time_utc": utc_iso(),
+    }
