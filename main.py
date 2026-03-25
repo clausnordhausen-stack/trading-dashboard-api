@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="9.0.0")
+app = FastAPI(title="Signal Agent API", version="9.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -425,7 +425,7 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "9.0.0",
+        "version": "9.1.0",
         "server_time_utc": utc_iso()
     }
 
@@ -1520,3 +1520,307 @@ def latest_signal(
         "gate": gate_payload,
         "signal": row
     }
+
+
+# -------------------------------------------------------------------
+# BUNDLE HELPERS
+# -------------------------------------------------------------------
+def build_overview_bundle(
+    symbol: str,
+    account: str,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+) -> Dict[str, Any]:
+    symbol = symbol.strip().upper()
+    account = account.strip()
+
+    system = system_overview(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+    latest = latest_signal(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    gate = gate_combo(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    risk = status_risk_engine(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    heartbeat = heartbeat_status(symbol=symbol)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic,
+        "systemOverview": system,
+        "latest": latest,
+        "gateCombo": gate,
+        "riskEngine": risk,
+        "heartbeat": heartbeat,
+    }
+
+
+def build_alerts_bundle(
+    symbol: str,
+    account: str,
+    magic: Optional[str] = None,
+) -> Dict[str, Any]:
+    symbol = symbol.strip().upper()
+    account = account.strip()
+
+    latest = latest_signal(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    gate = gate_combo(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    risk = status_risk_engine(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    heartbeat = heartbeat_status(symbol=symbol)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic,
+        "latest": latest,
+        "gateCombo": gate,
+        "riskEngine": risk,
+        "heartbeat": heartbeat,
+    }
+
+
+def build_activity_bundle(
+    symbol: str,
+    account: str,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+) -> Dict[str, Any]:
+    symbol = symbol.strip().upper()
+    account = account.strip()
+
+    system = system_overview(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+    latest = latest_signal(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    kpis = rolling_kpis(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic,
+        "systemOverview": system,
+        "latest": latest,
+        "kpis": kpis,
+    }
+
+
+def build_risk_bundle(
+    symbol: str,
+    account: str,
+    magic: Optional[str] = None,
+) -> Dict[str, Any]:
+    symbol = symbol.strip().upper()
+    account = account.strip()
+
+    risk = status_risk_engine(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    gate = gate_combo(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    latest = latest_signal(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic,
+        "riskEngine": risk,
+        "gateCombo": gate,
+        "latest": latest,
+    }
+
+
+def build_shell_bundle(
+    account: str,
+    symbols: List[str],
+    magic_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    account = account.strip()
+    magic_map = magic_map or {}
+
+    items = []
+
+    for raw_symbol in symbols:
+        symbol = raw_symbol.strip().upper()
+        try:
+            heartbeat = heartbeat_status(symbol=symbol)
+            hb_items = heartbeat.get("items", []) or []
+            connected_count = heartbeat.get("connected_count", 0)
+
+            online = bool(hb_items) or (
+                isinstance(connected_count, (int, float)) and connected_count > 0
+            )
+
+            items.append({
+                "symbol": symbol,
+                "magic": magic_map.get(symbol),
+                "status": "ONLINE" if online else "OFFLINE",
+                "connected_count": connected_count,
+                "heartbeat": heartbeat,
+            })
+        except Exception as e:
+            items.append({
+                "symbol": symbol,
+                "magic": magic_map.get(symbol),
+                "status": "ERROR",
+                "connected_count": 0,
+                "error": str(e),
+            })
+
+    return {
+        "ok": True,
+        "account": account,
+        "server_time_utc": utc_iso(),
+        "items": items,
+    }
+
+
+# -------------------------------------------------------------------
+# BUNDLE ENDPOINTS
+# -------------------------------------------------------------------
+@app.get("/bundle/overview")
+def bundle_overview(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    return build_overview_bundle(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+
+@app.get("/bundle/alerts")
+def bundle_alerts(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    return build_alerts_bundle(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+
+@app.get("/bundle/activity")
+def bundle_activity(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    return build_activity_bundle(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+
+@app.get("/bundle/risk")
+def bundle_risk(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    return build_risk_bundle(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+    )
+
+
+@app.get("/bundle/shell")
+def bundle_shell(
+    account: str = Query(...),
+    symbols: str = Query(..., description="Comma separated symbols"),
+    magic_map_json: Optional[str] = Query(default=None),
+):
+    parsed_symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    parsed_magic_map: Dict[str, str] = {}
+
+    if magic_map_json:
+        try:
+            parsed_magic_map = json.loads(magic_map_json)
+        except Exception:
+            parsed_magic_map = {}
+
+    return build_shell_bundle(
+        account=account,
+        symbols=parsed_symbols,
+        magic_map=parsed_magic_map,
+    )
