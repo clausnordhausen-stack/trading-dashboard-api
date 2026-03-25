@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="9.0.0")
+app = FastAPI(title="Signal Agent API", version="9.0.1")
 
 # -------------------------------------------------------------------
 # CORS
@@ -77,17 +77,14 @@ RED_R_SUM = float(os.getenv("RED_R_SUM", "-4.0"))
 YELLOW_WINRATE_MIN = float(os.getenv("YELLOW_WINRATE_MIN", "35.0"))
 RED_WINRATE_MIN = float(os.getenv("RED_WINRATE_MIN", "25.0"))
 
-# Phase 7
 SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "300"))
 
-# Phase 8 - Risk Engine
 RISK_ENGINE_ENABLED = os.getenv("RISK_ENGINE_ENABLED", "true").lower() == "true"
 DAILY_LOSS_CAP_USD = float(os.getenv("DAILY_LOSS_CAP_USD", "250.0"))
 DAILY_R_CAP = float(os.getenv("DAILY_R_CAP", "-5.0"))
 DAILY_MAX_TRADES = int(os.getenv("DAILY_MAX_TRADES", "10"))
 RISK_ENGINE_BLOCK_ON_BREACH = os.getenv("RISK_ENGINE_BLOCK_ON_BREACH", "true").lower() == "true"
 
-# Phase 9 - Execution Intelligence
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dynamic").strip().lower()
 SCORE_TO_RISK_ENABLED = os.getenv("SCORE_TO_RISK_ENABLED", "true").lower() == "true"
 SCORE_LOW_THRESHOLD = float(os.getenv("SCORE_LOW_THRESHOLD", "0.6"))
@@ -99,19 +96,16 @@ RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def utc_iso(dt: Optional[datetime] = None) -> str:
     if dt is None:
         dt = now_utc()
     return dt.astimezone(timezone.utc).isoformat()
-
 
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -126,13 +120,11 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-
 def utc_day_start(dt: Optional[datetime] = None) -> datetime:
     if dt is None:
         dt = now_utc()
     dt = dt.astimezone(timezone.utc)
     return datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=timezone.utc)
-
 
 def dict_factory(cursor, row):
     d = {}
@@ -140,12 +132,10 @@ def dict_factory(cursor, row):
         d[col[0]] = row[idx]
     return d
 
-
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = dict_factory
     return conn
-
 
 def safe_float(x, default=0.0):
     try:
@@ -155,7 +145,6 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-
 def safe_int(x, default=0):
     try:
         if x is None or x == "":
@@ -164,13 +153,11 @@ def safe_int(x, default=0):
     except Exception:
         return default
 
-
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
 
 def decode_token(token: str) -> dict:
     try:
@@ -180,7 +167,6 @@ def decode_token(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
         )
-
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = decode_token(token)
@@ -192,13 +178,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         )
     return {"username": username}
 
-
 def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
     if APP_TOKEN:
         if x_app_token != APP_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid app token")
     return True
-
 
 def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
     return {
@@ -209,7 +193,6 @@ def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
         "source": "default_env"
     }
 
-
 def normalize_side(value: Optional[str]) -> str:
     s = (value or "").strip().upper()
     if s == "LONG":
@@ -217,7 +200,6 @@ def normalize_side(value: Optional[str]) -> str:
     elif s == "SHORT":
         s = "SELL"
     return s
-
 
 def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = signal_row.get("payload", {}) or {}
@@ -252,7 +234,6 @@ def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any
         "score": score
     }
 
-
 def expire_old_signals():
     cutoff = utc_iso(now_utc() - timedelta(seconds=SIGNAL_TTL_SEC))
     with DB_LOCK:
@@ -266,7 +247,6 @@ def expire_old_signals():
         """, (cutoff,))
         conn.commit()
         conn.close()
-
 
 # -------------------------------------------------------------------
 # DB INIT
@@ -356,9 +336,7 @@ def init_db():
         conn.commit()
         conn.close()
 
-
 init_db()
-
 
 # -------------------------------------------------------------------
 # MODELS
@@ -367,15 +345,12 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
 
-
 class UserResponse(BaseModel):
     username: str
-
 
 class TVSignalIn(BaseModel):
     key: Optional[str] = None
@@ -385,13 +360,11 @@ class TVSignalIn(BaseModel):
     score: Optional[float] = 1.0
     payload: Optional[Dict[str, Any]] = None
 
-
 class AckIn(BaseModel):
     symbol: str
     updated_utc: str
     account: str
     magic: Optional[str] = None
-
 
 class HeartbeatPing(BaseModel):
     key: Optional[str] = None
@@ -402,7 +375,6 @@ class HeartbeatPing(BaseModel):
     version: Optional[str] = None
     status: Optional[str] = "alive"
     comment: Optional[str] = None
-
 
 class DealIn(BaseModel):
     account: Optional[str] = None
@@ -424,7 +396,6 @@ class DealIn(BaseModel):
     strategy: Optional[str] = None
     deal_time_utc: Optional[str] = None
 
-
 class RiskIn(BaseModel):
     account: Optional[str] = None
     magic: Optional[str] = None
@@ -434,7 +405,6 @@ class RiskIn(BaseModel):
     message: Optional[str] = None
     value: Optional[float] = None
 
-
 # -------------------------------------------------------------------
 # BASIC ROUTES
 # -------------------------------------------------------------------
@@ -443,10 +413,9 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "9.0.0",
+        "version": "9.0.1",
         "server_time_utc": utc_iso()
     }
-
 
 @app.get("/health")
 def health():
@@ -456,7 +425,6 @@ def health():
         "service": "signal-agent-api",
         "time": utc_iso()
     }
-
 
 # -------------------------------------------------------------------
 # AUTH ROUTES
@@ -475,11 +443,9 @@ def login(data: LoginRequest):
         "token_type": "bearer"
     }
 
-
 @app.get("/me", response_model=UserResponse)
 def me(current_user: dict = Depends(get_current_user)):
     return {"username": current_user["username"]}
-
 
 # -------------------------------------------------------------------
 # SIGNAL ROUTES
@@ -528,7 +494,6 @@ def tv_signal(
         "created_utc": now
     }
 
-
 @app.post("/ack")
 def ack_signal(data: AckIn):
     expire_old_signals()
@@ -573,7 +538,6 @@ def ack_signal(data: AckIn):
         "magic": data.magic
     }
 
-
 @app.post("/hb")
 def heartbeat(data: HeartbeatPing):
     if data.key and data.key != TV_API_KEY:
@@ -601,7 +565,6 @@ def heartbeat(data: HeartbeatPing):
         conn.close()
 
     return {"ok": True, "server_time_utc": utc_iso()}
-
 
 @app.get("/status/heartbeat")
 def heartbeat_status(symbol: Optional[str] = Query(default=None)):
@@ -663,7 +626,6 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
         "items": result
     }
 
-
 # -------------------------------------------------------------------
 # DEALS + RISKS
 # -------------------------------------------------------------------
@@ -711,7 +673,6 @@ def post_deal(data: DealIn):
 
     return {"ok": True}
 
-
 @app.post("/risk")
 def post_risk(data: RiskIn):
     with DB_LOCK:
@@ -736,7 +697,6 @@ def post_risk(data: RiskIn):
         conn.close()
 
     return {"ok": True}
-
 
 # -------------------------------------------------------------------
 # KPI CORE
@@ -782,7 +742,6 @@ def get_deals_filtered(
     rows = list(reversed(rows))
     return rows
 
-
 def get_deals_today(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
@@ -820,7 +779,6 @@ def get_deals_today(
 
     return rows
 
-
 def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
     curve = [0.0]
     running = 0.0
@@ -829,7 +787,6 @@ def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
         running += pnl
         curve.append(running)
     return curve
-
 
 def calc_max_drawdown_abs(curve: List[float]) -> float:
     peak = -10**18
@@ -841,7 +798,6 @@ def calc_max_drawdown_abs(curve: List[float]) -> float:
         if dd > max_dd:
             max_dd = dd
     return max_dd
-
 
 def calc_max_drawdown_pct(curve: List[float]) -> float:
     peak = None
@@ -855,7 +811,6 @@ def calc_max_drawdown_pct(curve: List[float]) -> float:
                 max_dd_pct = dd_pct
     return max_dd_pct
 
-
 def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     max_streak = 0
@@ -868,7 +823,6 @@ def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
             streak = 0
     return max_streak
 
-
 def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     for r in reversed(rows):
@@ -878,7 +832,6 @@ def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
         else:
             break
     return streak
-
 
 def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_trades = len(rows)
@@ -939,7 +892,6 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "current_loss_streak": current_loss_streak,
         "last_trade_time_utc": last_trade_time,
     }
-
 
 def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
     if not AUTO_GATE_ENABLED:
@@ -1006,7 +958,6 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": ["NORMAL"]
     }
 
-
 def compute_auto_gate(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
@@ -1029,7 +980,6 @@ def compute_auto_gate(
         "kpis": kpis,
         "gate": gate
     }
-
 
 # -------------------------------------------------------------------
 # PHASE 8 - RISK ENGINE
@@ -1101,7 +1051,6 @@ def compute_risk_engine(
         },
         "reasons": reasons
     }
-
 
 # -------------------------------------------------------------------
 # PHASE 9 - EXECUTION ENGINE
@@ -1192,7 +1141,6 @@ def compute_execution_engine(
         "reasons": reasons
     }
 
-
 # -------------------------------------------------------------------
 # CONTROLS + GATES
 # -------------------------------------------------------------------
@@ -1205,7 +1153,6 @@ def controls_effective(
         "ok": True,
         "controls": get_runtime_controls(symbol)
     }
-
 
 @app.get("/status/gate_auto")
 def gate_auto(
@@ -1236,7 +1183,6 @@ def gate_auto(
         "gate": result["gate"]
     }
 
-
 @app.get("/status/risk_engine")
 def status_risk_engine(
     symbol: Optional[str] = Query(default=None),
@@ -1253,7 +1199,6 @@ def status_risk_engine(
         },
         "risk_engine": result
     }
-
 
 @app.get("/status/execution_engine")
 def status_execution_engine(
@@ -1279,7 +1224,6 @@ def status_execution_engine(
         },
         "execution_engine": result
     }
-
 
 @app.get("/status/gate_combo")
 def gate_combo(
@@ -1328,7 +1272,6 @@ def gate_combo(
         "reasons": reasons
     }
 
-
 # -------------------------------------------------------------------
 # KPI ENDPOINTS
 # -------------------------------------------------------------------
@@ -1361,7 +1304,6 @@ def rolling_kpis(
         },
         "kpis": kpis
     }
-
 
 @app.get("/status/system_overview")
 def system_overview(
@@ -1410,7 +1352,6 @@ def system_overview(
         "gate": gate,
         "risk_engine": risk_engine
     }
-
 
 # -------------------------------------------------------------------
 # LATEST SIGNAL DELIVERY
@@ -1537,325 +1478,4 @@ def latest_signal(
         "controls": controls,
         "gate": gate_payload,
         "signal": row
-    }
-
-
-# -------------------------------------------------------------------
-# DEBUG ENDPOINTS
-# -------------------------------------------------------------------
-@app.get("/debug/signals/recent")
-def debug_recent_signals(
-    symbol: Optional[str] = Query(default=None),
-    limit: int = Query(default=20),
-):
-    limit = max(1, min(limit, 200))
-
-    query = """
-    SELECT *
-    FROM signals
-    """
-    params = []
-
-    if symbol:
-        query += " WHERE symbol = ?"
-        params.append(symbol.strip().upper())
-
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-
-    result = []
-    for row in rows:
-        try:
-            payload = json.loads(row.get("payload_json") or "{}")
-        except Exception:
-            payload = {}
-
-        result.append({
-            "id": row.get("id"),
-            "symbol": row.get("symbol"),
-            "side": row.get("side"),
-            "status": row.get("status"),
-            "created_utc": row.get("created_utc"),
-            "updated_utc": row.get("updated_utc"),
-            "payload": payload,
-        })
-
-    return {
-        "ok": True,
-        "count": len(result),
-        "items": result
-    }
-
-
-@app.get("/debug/acks/recent")
-def debug_recent_acks(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-    limit: int = Query(default=50),
-):
-    limit = max(1, min(limit, 200))
-
-    query = """
-    SELECT *
-    FROM signal_acks
-    WHERE 1=1
-    """
-    params = []
-
-    if symbol:
-        query += " AND symbol = ?"
-        params.append(symbol.strip().upper())
-
-    if account:
-        query += " AND account = ?"
-        params.append(account.strip())
-
-    if magic is not None:
-        query += " AND COALESCE(magic, '') = COALESCE(?, '')"
-        params.append(magic)
-
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-
-    return {
-        "ok": True,
-        "count": len(rows),
-        "items": rows
-    }
-
-
-@app.get("/debug/symbol_state")
-def debug_symbol_state(symbol: str = Query(...)):
-    symbol = symbol.strip().upper()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        SELECT *
-        FROM signals
-        WHERE symbol = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """, (symbol,))
-        latest_signal = cur.fetchone()
-
-        cur.execute("""
-        SELECT *
-        FROM signals
-        WHERE symbol = ?
-          AND status = 'pending'
-        ORDER BY id DESC
-        LIMIT 1
-        """, (symbol,))
-        latest_pending = cur.fetchone()
-
-        conn.close()
-
-    def unpack(row):
-        if not row:
-            return None
-        try:
-            payload = json.loads(row.get("payload_json") or "{}")
-        except Exception:
-            payload = {}
-        return {
-            "id": row.get("id"),
-            "symbol": row.get("symbol"),
-            "side": row.get("side"),
-            "status": row.get("status"),
-            "created_utc": row.get("created_utc"),
-            "updated_utc": row.get("updated_utc"),
-            "payload": payload,
-        }
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "latest_signal": unpack(latest_signal),
-        "latest_pending_signal": unpack(latest_pending),
-    }
-
-
-@app.get("/debug/consumers")
-def debug_consumers(symbol: Optional[str] = Query(default=None)):
-    hb = heartbeat_status(symbol=symbol)
-    return {
-        "ok": True,
-        "symbol": symbol.strip().upper() if symbol else None,
-        "connected_count": hb.get("connected_count", 0),
-        "items": hb.get("items", []),
-    }
-
-
-# -------------------------------------------------------------------
-# BUNDLE ENDPOINTS
-# -------------------------------------------------------------------
-@app.get("/bundle/overview")
-def bundle_overview(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    return {
-        "ok": True,
-        "symbol": symbol.strip().upper(),
-        "account": account.strip(),
-        "magic": magic,
-        "systemOverview": system_overview(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "latest": latest_signal(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "gateCombo": gate_combo(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "riskEngine": status_risk_engine(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "heartbeat": heartbeat_status(symbol=symbol),
-    }
-
-
-@app.get("/bundle/alerts")
-def bundle_alerts(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    return {
-        "ok": True,
-        "symbol": symbol.strip().upper(),
-        "account": account.strip(),
-        "magic": magic,
-        "latest": latest_signal(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "gateCombo": gate_combo(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "riskEngine": status_risk_engine(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "heartbeat": heartbeat_status(symbol=symbol),
-    }
-
-
-@app.get("/bundle/activity")
-def bundle_activity(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    return {
-        "ok": True,
-        "symbol": symbol.strip().upper(),
-        "account": account.strip(),
-        "magic": magic,
-        "systemOverview": system_overview(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "latest": latest_signal(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "kpis": rolling_kpis(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-    }
-
-
-@app.get("/bundle/risk")
-def bundle_risk(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    return {
-        "ok": True,
-        "symbol": symbol.strip().upper(),
-        "account": account.strip(),
-        "magic": magic,
-        "riskEngine": status_risk_engine(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "gateCombo": gate_combo(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-        "latest": latest_signal(
-            symbol=symbol,
-            account=account,
-            magic=magic,
-        ),
-    }
-
-
-@app.get("/bundle/shell")
-def bundle_shell(
-    account: str = Query(...),
-    symbols: str = Query(...),
-):
-    parsed_symbols = [
-        s.strip().upper()
-        for s in symbols.split(",")
-        if s.strip()
-    ]
-
-    items = []
-    for symbol in parsed_symbols:
-        hb = heartbeat_status(symbol=symbol)
-        gate = gate_combo(symbol=symbol, account=account, magic=None)
-
-        items.append({
-            "symbol": symbol,
-            "heartbeat": hb,
-            "gate": gate,
-        })
-
-    return {
-        "ok": True,
-        "account": account.strip(),
-        "symbols": parsed_symbols,
-        "items": items,
-        "server_time_utc": utc_iso(),
     }
