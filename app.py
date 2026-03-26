@@ -1,20 +1,16 @@
-import json
+from fastapi import FastAPI, HTTPException, Query, Depends, status, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any, Dict, List
+from jose import jwt, JWTError
 import os
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+import json
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from pydantic import BaseModel
-
-# -------------------------------------------------------------------
-# APP
-# -------------------------------------------------------------------
-app = FastAPI(title="Signal Agent API", version="10.1.0")
+app = FastAPI(title="Signal Agent API", version="11.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,15 +24,22 @@ app.add_middleware(
 # CONFIG
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
+DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
+DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
-DB_LOCK = threading.Lock()
+APP_USERNAME = os.getenv("APP_USERNAME", "admin")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
+MASTER_EMAIL = os.getenv("MASTER_EMAIL", APP_USERNAME)
+MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", APP_PASSWORD)
 
-DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
-HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
-SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "300"))
+DEMO_CUSTOMER_EMAIL = os.getenv("DEMO_CUSTOMER_EMAIL", "customer@claus.digital")
+DEMO_CUSTOMER_PASSWORD = os.getenv("DEMO_CUSTOMER_PASSWORD", "Customer123!")
+DEMO_CUSTOMER_CODE = os.getenv("DEMO_CUSTOMER_CODE", "CUS-1001")
+DEMO_CUSTOMER_NAME = os.getenv("DEMO_CUSTOMER_NAME", "Demo Customer")
 
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 APP_TOKEN_HEADER = os.getenv("APP_TOKEN_HEADER", "X-APP-TOKEN").strip() or "X-APP-TOKEN"
@@ -64,6 +67,8 @@ RED_R_SUM = float(os.getenv("RED_R_SUM", "-4.0"))
 YELLOW_WINRATE_MIN = float(os.getenv("YELLOW_WINRATE_MIN", "35.0"))
 RED_WINRATE_MIN = float(os.getenv("RED_WINRATE_MIN", "25.0"))
 
+SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "300"))
+
 RISK_ENGINE_ENABLED = os.getenv("RISK_ENGINE_ENABLED", "true").lower() == "true"
 DAILY_LOSS_CAP_USD = float(os.getenv("DAILY_LOSS_CAP_USD", "250.0"))
 DAILY_R_CAP = float(os.getenv("DAILY_R_CAP", "-5.0"))
@@ -80,16 +85,8 @@ RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 
 AUTHORIZED_CONSUMERS_STRICT = os.getenv("AUTHORIZED_CONSUMERS_STRICT", "false").lower() == "true"
 
-# Aktuell nur ein Master-Login.
-MASTER_EMAIL = os.getenv("MASTER_EMAIL", "master@claus.digital").strip().lower()
-MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "123456").strip()
-
-# Legacy-Fallback, falls ihr vorübergehend noch alte Umgebungsvariablen nutzt.
-APP_USERNAME = os.getenv("APP_USERNAME", "admin").strip()
-APP_PASSWORD = os.getenv("APP_PASSWORD", "123456").strip()
-
+DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
 
 # -------------------------------------------------------------------
 # HELPERS
@@ -108,8 +105,9 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
-        dt = datetime.fromisoformat(normalized)
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -118,12 +116,17 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
 
 
 def utc_day_start(dt: Optional[datetime] = None) -> datetime:
-    dt = (dt or now_utc()).astimezone(timezone.utc)
+    if dt is None:
+        dt = now_utc()
+    dt = dt.astimezone(timezone.utc)
     return datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def dict_factory(cursor, row):
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
 
 
 def get_conn():
@@ -132,45 +135,29 @@ def get_conn():
     return conn
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+def safe_float(x, default=0.0):
     try:
-        if value in (None, ""):
+        if x is None or x == "":
             return default
-        return float(value)
+        return float(x)
     except Exception:
         return default
 
 
-def safe_int(value: Any, default: int = 0) -> int:
+def safe_int(x, default=0):
     try:
-        if value in (None, ""):
+        if x is None or x == "":
             return default
-        return int(value)
+        return int(x)
     except Exception:
         return default
 
 
-def normalize_side(value: Optional[str]) -> str:
-    side = (value or "").strip().upper()
-    if side == "LONG":
-        return "BUY"
-    if side == "SHORT":
-        return "SELL"
-    return side
-
-
-def load_signal_payload(row: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        return json.loads(row.get("payload_json") or "{}")
-    except Exception:
-        return {}
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    payload = data.copy()
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
     expire = now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    payload.update({"exp": expire})
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def decode_token(token: str) -> dict:
@@ -179,29 +166,34 @@ def decode_token(token: str) -> dict:
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
+            detail="Invalid token"
         )
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
-    payload = decode_token(token)
-    email = payload.get("sub")
-    role = payload.get("role")
-    if not email:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-        )
-    return {
-        "email": email,
-        "role": role or "master_admin",
-    }
 
 
 def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
-    if APP_TOKEN and x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid app token")
+    if APP_TOKEN:
+        if x_app_token != APP_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid app token")
     return True
+
+
+def normalize_side(value: Optional[str]) -> str:
+    s = (value or "").strip().upper()
+    if s == "LONG":
+        s = "BUY"
+    elif s == "SHORT":
+        s = "SELL"
+    return s
+
+
+def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "paused": DEFAULT_PAUSED,
+        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
+        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
+        "symbol": symbol.upper() if symbol else None,
+        "source": "default_env"
+    }
 
 
 def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
@@ -216,14 +208,13 @@ def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
     conn.close()
 
 
-def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
-    return {
-        "paused": DEFAULT_PAUSED,
-        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
-        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
-        "symbol": symbol.upper() if symbol else None,
-        "source": "default_env",
-    }
+def load_signal_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {}
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    return payload
 
 
 def get_signal_row_by_id(signal_id: int) -> Optional[Dict[str, Any]]:
@@ -233,10 +224,285 @@ def get_signal_row_by_id(signal_id: int) -> Optional[Dict[str, Any]]:
         cur.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
         row = cur.fetchone()
         conn.close()
-
     if row:
         row["payload"] = load_signal_payload(row)
     return row
+
+
+def dt_or_none(value: Optional[str]) -> Optional[str]:
+    dt = parse_dt(value)
+    return utc_iso(dt) if dt else None
+
+
+# -------------------------------------------------------------------
+# AUTH / USER HELPERS
+# -------------------------------------------------------------------
+def get_user_by_login(identifier: str) -> Optional[Dict[str, Any]]:
+    identifier = identifier.strip()
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE lower(email) = lower(?) OR lower(username) = lower(?)
+            LIMIT 1
+            """,
+            (identifier, identifier),
+        )
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_customer_by_id(customer_id: int) -> Optional[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_customer_accounts(customer_id: int) -> List[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM customer_accounts
+            WHERE customer_id = ?
+            ORDER BY id ASC
+            """,
+            (customer_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    return rows
+
+
+def get_customer_strategies(customer_id: int) -> List[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM customer_strategies
+            WHERE customer_id = ?
+            ORDER BY sort_order ASC, id ASC
+            """,
+            (customer_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    return rows
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = decode_token(token)
+    user_id_raw = payload.get("sub")
+    if not user_id_raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
+
+    try:
+        user_id = int(user_id_raw)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
+
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+
+    if safe_int(user.get("is_active"), 0) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User inactive"
+        )
+
+    return user
+
+
+def require_master(current_user: dict = Depends(get_current_user)):
+    if (current_user.get("role") or "").lower() != "master":
+        raise HTTPException(status_code=403, detail="Master access required")
+    return current_user
+
+
+def compute_customer_access(customer: Dict[str, Any]) -> Dict[str, Any]:
+    access_start = parse_dt(customer.get("access_start_at"))
+    access_end = parse_dt(customer.get("access_end_at"))
+    grace_until = parse_dt(customer.get("grace_until"))
+
+    access_status_db = (customer.get("access_status") or "active").lower()
+    trading_status_db = (customer.get("trading_status") or "enabled").lower()
+    subscription_status = (customer.get("subscription_status") or "active").lower()
+
+    now = now_utc()
+    effective_access_status = access_status_db
+    effective_trading_status = trading_status_db
+
+    if access_status_db == "paused" or subscription_status == "paused":
+        effective_access_status = "paused"
+        effective_trading_status = "disabled"
+    elif access_end and now > access_end:
+        if grace_until and now <= grace_until:
+            effective_access_status = "grace"
+        else:
+            effective_access_status = "expired"
+        effective_trading_status = "disabled"
+    elif subscription_status in ("expired", "canceled"):
+        effective_access_status = "expired"
+        effective_trading_status = "disabled"
+    elif trading_status_db != "enabled":
+        effective_trading_status = "disabled"
+    else:
+        effective_trading_status = "enabled"
+        if access_status_db not in ("active", "grace", "expired", "paused"):
+            effective_access_status = "active"
+
+    return {
+        "access_start_at": dt_or_none(customer.get("access_start_at")),
+        "access_end_at": dt_or_none(customer.get("access_end_at")),
+        "grace_until": dt_or_none(customer.get("grace_until")),
+        "access_status": effective_access_status,
+        "trading_status": effective_trading_status,
+        "subscription_status": subscription_status,
+        "risk_profile": customer.get("risk_profile") or "balanced",
+    }
+
+
+def build_me_payload(user: Dict[str, Any]) -> Dict[str, Any]:
+    role = (user.get("role") or "").lower()
+
+    base = {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "email": user.get("email"),
+        "role": role,
+        "is_active": bool(safe_int(user.get("is_active"), 0)),
+        "customer_id": user.get("customer_id"),
+    }
+
+    if role == "master":
+        return {
+            **base,
+            "display_name": "Master",
+            "customer_code": None,
+            "access_start_at": None,
+            "access_end_at": None,
+            "grace_until": None,
+            "access_status": "active",
+            "trading_status": "enabled",
+            "subscription_status": "active",
+            "risk_profile": "dynamic",
+            "accounts": [],
+            "strategies": [],
+        }
+
+    customer_id = user.get("customer_id")
+    if not customer_id:
+        return {
+            **base,
+            "display_name": user.get("email") or user.get("username") or "Customer",
+            "customer_code": None,
+            "access_start_at": None,
+            "access_end_at": None,
+            "grace_until": None,
+            "access_status": "expired",
+            "trading_status": "disabled",
+            "subscription_status": "expired",
+            "risk_profile": "balanced",
+            "accounts": [],
+            "strategies": [],
+        }
+
+    customer = get_customer_by_id(int(customer_id))
+    if not customer:
+        return {
+            **base,
+            "display_name": user.get("email") or user.get("username") or "Customer",
+            "customer_code": None,
+            "access_start_at": None,
+            "access_end_at": None,
+            "grace_until": None,
+            "access_status": "expired",
+            "trading_status": "disabled",
+            "subscription_status": "expired",
+            "risk_profile": "balanced",
+            "accounts": [],
+            "strategies": [],
+        }
+
+    access = compute_customer_access(customer)
+
+    return {
+        **base,
+        "display_name": customer.get("display_name") or user.get("email") or "Customer",
+        "customer_code": customer.get("code"),
+        **access,
+        "accounts": get_customer_accounts(int(customer_id)),
+        "strategies": get_customer_strategies(int(customer_id)),
+    }
+
+
+# -------------------------------------------------------------------
+# SIGNAL FILTER
+# -------------------------------------------------------------------
+def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = signal_row.get("payload", {}) or {}
+    score = safe_float(payload.get("score"), 1.0)
+
+    gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
+
+    if gate_level == "RED":
+        return {
+            "approved": False,
+            "reason": "GATE_RED",
+            "score": score
+        }
+
+    if score < 0.60:
+        return {
+            "approved": False,
+            "reason": "SCORE_LT_0_60",
+            "score": score
+        }
+
+    if gate_level == "YELLOW" and score < 0.75:
+        return {
+            "approved": False,
+            "reason": "YELLOW_SCORE_LT_0_75",
+            "score": score
+        }
+
+    return {
+        "approved": True,
+        "reason": "APPROVED",
+        "score": score
+    }
 
 
 def expire_old_signals_and_deliveries():
@@ -247,49 +513,41 @@ def expire_old_signals_and_deliveries():
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute(
-            """
-            UPDATE signal_deliveries
-            SET delivery_status = 'expired',
-                expire_utc = COALESCE(expire_utc, ?),
-                updated_utc = ?
-            WHERE delivery_status IN ('pending', 'delivered')
-              AND created_utc < ?
-            """,
-            (utc_iso(), utc_iso(), cutoff_iso),
-        )
+        cur.execute("""
+        UPDATE signal_deliveries
+        SET delivery_status = 'expired',
+            expire_utc = COALESCE(expire_utc, ?),
+            updated_utc = ?
+        WHERE delivery_status IN ('pending', 'delivered')
+          AND created_utc < ?
+        """, (utc_iso(), utc_iso(), cutoff_iso))
 
-        cur.execute(
-            """
-            UPDATE signals
-            SET status = CASE
-                WHEN NOT EXISTS (
-                    SELECT 1
-                    FROM signal_deliveries d
-                    WHERE d.signal_id = signals.id
-                      AND d.delivery_status IN ('pending', 'delivered', 'acked')
-                ) THEN 'closed'
-                ELSE status
-            END
-            WHERE status IN ('pending', 'distributed')
-            """
-        )
+        cur.execute("""
+        UPDATE signals
+        SET status = CASE
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM signal_deliveries d
+                WHERE d.signal_id = signals.id
+                  AND d.delivery_status IN ('pending', 'delivered', 'acked')
+            ) THEN 'closed'
+            ELSE status
+        END
+        WHERE status IN ('pending', 'distributed')
+        """)
 
-        cur.execute(
-            """
-            UPDATE signals
-            SET status = 'expired'
-            WHERE status IN ('pending', 'distributed')
-              AND created_utc < ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM signal_deliveries d
-                  WHERE d.signal_id = signals.id
-                    AND d.delivery_status IN ('pending', 'delivered', 'acked')
-              )
-            """,
-            (cutoff_iso,),
-        )
+        cur.execute("""
+        UPDATE signals
+        SET status = 'expired'
+        WHERE status IN ('pending', 'distributed')
+          AND created_utc < ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM signal_deliveries d
+              WHERE d.signal_id = signals.id
+                AND d.delivery_status IN ('pending', 'delivered', 'acked')
+          )
+        """, (cutoff_iso,))
 
         conn.commit()
         conn.close()
@@ -303,134 +561,203 @@ def init_db():
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                side TEXT,
-                payload_json TEXT,
-                created_utc TEXT NOT NULL,
-                updated_utc TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
-            )
-            """
+        # ----------------------------
+        # auth / customer area
+        # ----------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            email TEXT,
+            access_start_at TEXT,
+            access_end_at TEXT,
+            access_status TEXT NOT NULL DEFAULT 'active',
+            trading_status TEXT NOT NULL DEFAULT 'enabled',
+            subscription_status TEXT NOT NULL DEFAULT 'active',
+            grace_until TEXT,
+            risk_profile TEXT NOT NULL DEFAULT 'balanced',
+            notes TEXT,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS signal_acks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                account TEXT NOT NULL,
-                magic TEXT,
-                ack_utc TEXT NOT NULL,
-                delivery_id INTEGER,
-                UNIQUE(signal_id, account, magic)
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            email TEXT UNIQUE,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            customer_id INTEGER,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS heartbeats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account TEXT,
-                magic TEXT,
-                symbol TEXT,
-                ea_name TEXT,
-                version TEXT,
-                last_seen_utc TEXT NOT NULL,
-                status TEXT,
-                comment TEXT,
-                owner_name TEXT
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customer_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            account_number TEXT NOT NULL,
+            account_label TEXT NOT NULL,
+            broker_name TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS deals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account TEXT,
-                magic TEXT,
-                symbol TEXT,
-                side TEXT,
-                ticket TEXT,
-                volume REAL,
-                entry_price REAL,
-                exit_price REAL,
-                sl REAL,
-                tp REAL,
-                pnl REAL,
-                pnl_currency TEXT,
-                commission REAL,
-                swap REAL,
-                risk_amount REAL,
-                r_multiple REAL,
-                strategy TEXT,
-                deal_time_utc TEXT NOT NULL,
-                created_utc TEXT NOT NULL,
-                signal_id INTEGER
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customer_strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            account_number TEXT,
+            symbol TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            magic TEXT NOT NULL,
+            strategy_code TEXT,
+            risk_tier TEXT NOT NULL DEFAULT 'medium',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 999,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS risks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account TEXT,
-                magic TEXT,
-                symbol TEXT,
-                event_type TEXT,
-                level TEXT,
-                message TEXT,
-                value REAL,
-                created_utc TEXT NOT NULL
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS access_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            actor_user_id INTEGER,
+            action_type TEXT NOT NULL,
+            action_message TEXT NOT NULL,
+            payload_json TEXT,
+            created_utc TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id),
+            FOREIGN KEY(actor_user_id) REFERENCES users(id)
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS authorized_consumers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account TEXT NOT NULL,
-                magic TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                owner_name TEXT,
-                notes TEXT,
-                created_utc TEXT NOT NULL,
-                updated_utc TEXT NOT NULL,
-                UNIQUE(account, magic, symbol)
-            )
-            """
+        # ----------------------------
+        # existing signal engine
+        # ----------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT,
+            payload_json TEXT,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS signal_deliveries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER NOT NULL,
-                account TEXT NOT NULL,
-                magic TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                delivery_status TEXT NOT NULL DEFAULT 'pending',
-                first_seen_utc TEXT,
-                ack_utc TEXT,
-                filled_utc TEXT,
-                expire_utc TEXT,
-                updated_utc TEXT NOT NULL,
-                created_utc TEXT NOT NULL,
-                ticket TEXT,
-                error_message TEXT,
-                UNIQUE(signal_id, account, magic, symbol)
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_acks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            account TEXT NOT NULL,
+            magic TEXT,
+            ack_utc TEXT NOT NULL,
+            UNIQUE(signal_id, account, magic)
         )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            ea_name TEXT,
+            version TEXT,
+            last_seen_utc TEXT NOT NULL,
+            status TEXT,
+            comment TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            side TEXT,
+            ticket TEXT,
+            volume REAL,
+            entry_price REAL,
+            exit_price REAL,
+            sl REAL,
+            tp REAL,
+            pnl REAL,
+            pnl_currency TEXT,
+            commission REAL,
+            swap REAL,
+            risk_amount REAL,
+            r_multiple REAL,
+            strategy TEXT,
+            deal_time_utc TEXT NOT NULL,
+            created_utc TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS risks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            event_type TEXT,
+            level TEXT,
+            message TEXT,
+            value REAL,
+            created_utc TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS authorized_consumers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT NOT NULL,
+            magic TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            owner_name TEXT,
+            notes TEXT,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            UNIQUE(account, magic, symbol)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            account TEXT NOT NULL,
+            magic TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            delivery_status TEXT NOT NULL DEFAULT 'pending',
+            first_seen_utc TEXT,
+            ack_utc TEXT,
+            filled_utc TEXT,
+            expire_utc TEXT,
+            updated_utc TEXT NOT NULL,
+            created_utc TEXT NOT NULL,
+            ticket TEXT,
+            error_message TEXT,
+            UNIQUE(signal_id, account, magic, symbol)
+        )
+        """)
 
         conn.commit()
         conn.close()
@@ -438,6 +765,124 @@ def init_db():
     ensure_column_exists("deals", "signal_id", "signal_id INTEGER")
     ensure_column_exists("signal_acks", "delivery_id", "delivery_id INTEGER")
     ensure_column_exists("heartbeats", "owner_name", "owner_name TEXT")
+    ensure_column_exists("users", "username", "username TEXT")
+    ensure_column_exists("users", "email", "email TEXT")
+    ensure_column_exists("users", "customer_id", "customer_id INTEGER")
+    ensure_column_exists("customers", "subscription_status", "subscription_status TEXT NOT NULL DEFAULT 'active'")
+    ensure_column_exists("customers", "grace_until", "grace_until TEXT")
+    ensure_column_exists("customers", "risk_profile", "risk_profile TEXT NOT NULL DEFAULT 'balanced'")
+    ensure_column_exists("customers", "notes", "notes TEXT")
+
+    seed_auth_data()
+
+
+def seed_auth_data():
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # master
+        cur.execute(
+            """
+            SELECT id FROM users
+            WHERE lower(email) = lower(?) OR lower(username) = lower(?)
+            LIMIT 1
+            """,
+            (MASTER_EMAIL, MASTER_EMAIL),
+        )
+        existing_master = cur.fetchone()
+
+        if not existing_master:
+            cur.execute(
+                """
+                INSERT INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
+                VALUES (?, ?, ?, 'master', 1, NULL, ?, ?)
+                """,
+                (MASTER_EMAIL, MASTER_EMAIL, MASTER_PASSWORD, now, now),
+            )
+
+        # demo customer
+        cur.execute("SELECT id FROM customers WHERE code = ?", (DEMO_CUSTOMER_CODE,))
+        customer = cur.fetchone()
+
+        if not customer:
+            access_start = utc_iso(now_utc() - timedelta(days=7))
+            access_end = utc_iso(now_utc() + timedelta(days=30))
+
+            cur.execute(
+                """
+                INSERT INTO customers(
+                    code, display_name, email, access_start_at, access_end_at,
+                    access_status, trading_status, subscription_status, grace_until,
+                    risk_profile, notes, created_utc, updated_utc
+                )
+                VALUES (?, ?, ?, ?, ?, 'active', 'enabled', 'active', NULL, 'balanced', ?, ?, ?)
+                """,
+                (
+                    DEMO_CUSTOMER_CODE,
+                    DEMO_CUSTOMER_NAME,
+                    DEMO_CUSTOMER_EMAIL,
+                    access_start,
+                    access_end,
+                    "Seeded demo customer",
+                    now,
+                    now,
+                ),
+            )
+            customer_id = cur.lastrowid
+
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
+                VALUES (?, ?, ?, 'customer', 1, ?, ?, ?)
+                """,
+                (DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_PASSWORD, customer_id, now, now),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO customer_accounts(customer_id, account_number, account_label, broker_name, enabled, created_utc, updated_utc)
+                VALUES (?, ?, ?, ?, 1, ?, ?)
+                """,
+                (customer_id, "195333", "Main Account", "Demo Broker", now, now),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO customer_strategies(customer_id, account_number, symbol, display_name, magic, strategy_code, risk_tier, enabled, sort_order, created_utc, updated_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (customer_id, "195333", "XAUUSD", "Gold", "777", "xau_core", "medium", 1, now, now),
+            )
+            cur.execute(
+                """
+                INSERT INTO customer_strategies(customer_id, account_number, symbol, display_name, magic, strategy_code, risk_tier, enabled, sort_order, created_utc, updated_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (customer_id, "195333", "BTCUSD", "Bitcoin", "62001", "btc_core", "high", 2, now, now),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO access_audits(customer_id, actor_user_id, action_type, action_message, payload_json, created_utc)
+                VALUES (?, NULL, 'seed', 'Demo customer created', NULL, ?)
+                """,
+                (customer_id, now),
+            )
+        else:
+            customer_id = customer["id"]
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
+                VALUES (?, ?, ?, 'customer', 1, ?, ?, ?)
+                """,
+                (DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_PASSWORD, customer_id, now, now),
+            )
+
+        conn.commit()
+        conn.close()
 
 
 init_db()
@@ -446,18 +891,14 @@ init_db()
 # MODELS
 # -------------------------------------------------------------------
 class LoginRequest(BaseModel):
-    email: str
+    username: Optional[str] = None
+    email: Optional[str] = None
     password: str
 
 
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
-
-
-class UserResponse(BaseModel):
-    email: str
-    role: str
 
 
 class TVSignalIn(BaseModel):
@@ -530,44 +971,97 @@ class ConsumerUpsertIn(BaseModel):
     notes: Optional[str] = None
 
 
-class Signal(BaseModel):
-    symbol: str
-    side: str
-    price: float
-    timestamp: Optional[str] = None
-
-
 # -------------------------------------------------------------------
 # AUTH ROUTES
 # -------------------------------------------------------------------
 @app.post("/login", response_model=TokenResponse)
 def login(data: LoginRequest):
-    email = data.email.strip().lower()
+    identifier = (data.email or data.username or "").strip()
     password = data.password.strip()
 
-    email_ok = email == MASTER_EMAIL
-    legacy_ok = email == APP_USERNAME.lower()
+    if not identifier:
+        raise HTTPException(status_code=422, detail="email or username required")
 
-    if not ((email_ok and password == MASTER_PASSWORD) or (legacy_ok and password == APP_PASSWORD)):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    user = get_user_by_login(identifier)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_access_token(
+    if safe_int(user.get("is_active"), 0) != 1:
+        raise HTTPException(status_code=403, detail="User inactive")
+
+    if (user.get("password") or "") != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    access_token = create_access_token(
         {
-            "sub": email,
-            "role": "master_admin",
+            "sub": str(user["id"]),
+            "email": user.get("email"),
+            "role": user.get("role"),
         }
     )
     return {
-        "access_token": token,
-        "token_type": "bearer",
+        "access_token": access_token,
+        "token_type": "bearer"
     }
 
 
-@app.get("/me", response_model=UserResponse)
+@app.get("/me")
 def me(current_user: dict = Depends(get_current_user)):
+    return build_me_payload(current_user)
+
+
+@app.get("/master/customers")
+def master_customers(current_user: dict = Depends(require_master)):
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM customers
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+    items = []
+    for customer in rows:
+        customer_id = int(customer["id"])
+        access = compute_customer_access(customer)
+
+        with DB_LOCK:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, username, email, role, is_active
+                FROM users
+                WHERE customer_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (customer_id,),
+            )
+            user = cur.fetchone()
+            conn.close()
+
+        items.append({
+            "id": customer_id,
+            "code": customer.get("code"),
+            "display_name": customer.get("display_name"),
+            "email": customer.get("email"),
+            "notes": customer.get("notes"),
+            "user": user,
+            **access,
+            "accounts": get_customer_accounts(customer_id),
+            "strategies": get_customer_strategies(customer_id),
+        })
+
     return {
-        "email": current_user["email"],
-        "role": current_user["role"],
+        "ok": True,
+        "count": len(items),
+        "items": items,
     }
 
 
@@ -579,8 +1073,8 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "10.1.0",
-        "server_time_utc": utc_iso(),
+        "version": "11.0.0",
+        "server_time_utc": utc_iso()
     }
 
 
@@ -590,27 +1084,7 @@ def health():
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "time": utc_iso(),
-    }
-
-
-@app.post("/signal")
-async def receive_signal(signal: Signal):
-    return {
-        "status": "received",
-        "symbol": signal.symbol,
-        "side": signal.side,
-        "price": signal.price,
-        "timestamp": signal.timestamp,
-    }
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    return {
-        "status": "ok",
-        "data": data,
+        "time": utc_iso()
     }
 
 
@@ -622,23 +1096,18 @@ def list_authorized_consumers(symbol: Optional[str] = None) -> List[Dict[str, An
         conn = get_conn()
         cur = conn.cursor()
         if symbol:
-            cur.execute(
-                """
-                SELECT *
-                FROM authorized_consumers
-                WHERE symbol = ?
-                ORDER BY account, magic, symbol
-                """,
-                (symbol.upper(),),
-            )
+            cur.execute("""
+            SELECT *
+            FROM authorized_consumers
+            WHERE symbol = ?
+            ORDER BY account, magic, symbol
+            """, (symbol.upper(),))
         else:
-            cur.execute(
-                """
-                SELECT *
-                FROM authorized_consumers
-                ORDER BY symbol, account, magic
-                """
-            )
+            cur.execute("""
+            SELECT *
+            FROM authorized_consumers
+            ORDER BY symbol, account, magic
+            """)
         rows = cur.fetchall()
         conn.close()
     return rows
@@ -651,52 +1120,45 @@ def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM heartbeats
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 500
-            """,
-            (symbol,),
-        )
+        cur.execute("""
+        SELECT *
+        FROM heartbeats
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 500
+        """, (symbol,))
         rows = cur.fetchall()
         conn.close()
 
-    latest_map: Dict[tuple, Dict[str, Any]] = {}
-    for row in rows:
-        key = (row.get("account") or "", row.get("magic") or "", row.get("symbol") or "")
+    latest_map = {}
+    for r in rows:
+        key = (r.get("account") or "", r.get("magic") or "", r.get("symbol") or "")
         if key not in latest_map:
-            latest_map[key] = row
+            latest_map[key] = r
 
-    consumers: List[Dict[str, Any]] = []
-    for row in latest_map.values():
-        last_seen = parse_dt(row.get("last_seen_utc"))
+    consumers = []
+    for _, r in latest_map.items():
+        last_seen = parse_dt(r.get("last_seen_utc"))
         if not last_seen or last_seen < cutoff:
             continue
-
-        account = (row.get("account") or "").strip()
-        magic = (row.get("magic") or "").strip()
-        hb_symbol = (row.get("symbol") or "").strip().upper()
-
+        account = (r.get("account") or "").strip()
+        magic = (r.get("magic") or "").strip()
+        hb_symbol = (r.get("symbol") or "").strip().upper()
         if account and magic and hb_symbol == symbol:
-            consumers.append(
-                {
-                    "account": account,
-                    "magic": magic,
-                    "symbol": hb_symbol,
-                    "enabled": 1,
-                    "owner_name": row.get("owner_name"),
-                    "notes": "heartbeat_fallback",
-                }
-            )
+            consumers.append({
+                "account": account,
+                "magic": magic,
+                "symbol": hb_symbol,
+                "enabled": 1,
+                "owner_name": r.get("owner_name"),
+                "notes": "heartbeat_fallback"
+            })
 
-    unique_map: Dict[tuple, Dict[str, Any]] = {}
-    for item in consumers:
-        key = (item["account"], item["magic"], item["symbol"])
+    unique_map = {}
+    for c in consumers:
+        key = (c["account"], c["magic"], c["symbol"])
         if key not in unique_map:
-            unique_map[key] = item
+            unique_map[key] = c
 
     return list(unique_map.values())
 
@@ -704,8 +1166,8 @@ def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
 def resolve_target_consumers(symbol: str) -> List[Dict[str, Any]]:
     symbol = symbol.upper()
     authorized = [
-        row for row in list_authorized_consumers(symbol=symbol)
-        if safe_int(row.get("enabled"), 0) == 1
+        r for r in list_authorized_consumers(symbol=symbol)
+        if safe_int(r.get("enabled"), 0) == 1
     ]
 
     if authorized:
@@ -723,14 +1185,14 @@ def consumers(symbol: Optional[str] = Query(default=None)):
     return {
         "ok": True,
         "count": len(items),
-        "items": items,
+        "items": items
     }
 
 
 @app.post("/consumers/upsert")
 def consumers_upsert(
     data: ConsumerUpsertIn,
-    _: bool = Depends(app_token_guard),
+    _: bool = Depends(app_token_guard)
 ):
     symbol = data.symbol.strip().upper()
     account = data.account.strip()
@@ -740,33 +1202,27 @@ def consumers_upsert(
         raise HTTPException(status_code=422, detail="account, magic, symbol required")
 
     now = utc_iso()
-
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO authorized_consumers(
-                account, magic, symbol, enabled, owner_name, notes, created_utc, updated_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account, magic, symbol) DO UPDATE SET
-                enabled = excluded.enabled,
-                owner_name = excluded.owner_name,
-                notes = excluded.notes,
-                updated_utc = excluded.updated_utc
-            """,
-            (
-                account,
-                magic,
-                symbol,
-                1 if data.enabled else 0,
-                data.owner_name,
-                data.notes,
-                now,
-                now,
-            ),
-        )
+        cur.execute("""
+        INSERT INTO authorized_consumers(account, magic, symbol, enabled, owner_name, notes, created_utc, updated_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account, magic, symbol) DO UPDATE SET
+            enabled = excluded.enabled,
+            owner_name = excluded.owner_name,
+            notes = excluded.notes,
+            updated_utc = excluded.updated_utc
+        """, (
+            account,
+            magic,
+            symbol,
+            1 if data.enabled else 0,
+            data.owner_name,
+            data.notes,
+            now,
+            now
+        ))
         conn.commit()
         conn.close()
 
@@ -775,7 +1231,7 @@ def consumers_upsert(
         "account": account,
         "magic": magic,
         "symbol": symbol,
-        "enabled": data.enabled,
+        "enabled": data.enabled
     }
 
 
@@ -793,32 +1249,26 @@ def heartbeat(data: HeartbeatPing):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO heartbeats(
-                account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data.account,
-                data.magic,
-                symbol,
-                data.ea_name,
-                data.version,
-                now,
-                data.status,
-                data.comment,
-                data.owner_name,
-            ),
-        )
+
+        cur.execute("""
+        INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            symbol,
+            data.ea_name,
+            data.version,
+            now,
+            data.status,
+            data.comment,
+            data.owner_name
+        ))
+
         conn.commit()
         conn.close()
 
-    return {
-        "ok": True,
-        "server_time_utc": now,
-    }
+    return {"ok": True, "server_time_utc": now}
 
 
 @app.get("/status/heartbeat")
@@ -829,64 +1279,57 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         if symbol_norm:
-            cur.execute(
-                """
-                SELECT *
-                FROM heartbeats
-                WHERE symbol = ?
-                ORDER BY id DESC
-                LIMIT 500
-                """,
-                (symbol_norm,),
-            )
+            cur.execute("""
+            SELECT * FROM heartbeats
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 500
+            """, (symbol_norm,))
         else:
-            cur.execute(
-                """
-                SELECT *
-                FROM heartbeats
-                ORDER BY id DESC
-                LIMIT 1000
-                """
-            )
+            cur.execute("""
+            SELECT * FROM heartbeats
+            ORDER BY id DESC
+            LIMIT 1000
+            """)
+
         rows = cur.fetchall()
         conn.close()
 
-    latest_map: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        key = f"{row.get('account','')}|{row.get('magic','')}|{row.get('symbol','')}"
+    latest_map = {}
+    for r in rows:
+        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
         if key not in latest_map:
-            latest_map[key] = row
+            latest_map[key] = r
 
-    result: List[Dict[str, Any]] = []
+    result = []
     connected_count = 0
 
-    for row in latest_map.values():
-        last_seen = parse_dt(row["last_seen_utc"])
+    for _, r in latest_map.items():
+        last_seen = parse_dt(r["last_seen_utc"])
         connected = bool(last_seen and last_seen >= cutoff)
         if connected:
             connected_count += 1
 
-        result.append(
-            {
-                "account": row.get("account"),
-                "magic": row.get("magic"),
-                "symbol": row.get("symbol"),
-                "ea_name": row.get("ea_name"),
-                "version": row.get("version"),
-                "last_seen_utc": row.get("last_seen_utc"),
-                "connected": connected,
-                "status": row.get("status"),
-                "comment": row.get("comment"),
-                "owner_name": row.get("owner_name"),
-            }
-        )
+        result.append({
+            "account": r.get("account"),
+            "magic": r.get("magic"),
+            "symbol": r.get("symbol"),
+            "ea_name": r.get("ea_name"),
+            "version": r.get("version"),
+            "last_seen_utc": r.get("last_seen_utc"),
+            "connected": connected,
+            "status": r.get("status"),
+            "comment": r.get("comment"),
+            "owner_name": r.get("owner_name"),
+        })
 
     return {
         "ok": True,
         "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
         "connected_count": connected_count,
-        "items": result,
+        "items": result
     }
 
 
@@ -898,54 +1341,46 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
     targets = resolve_target_consumers(symbol)
     now = utc_iso()
 
-    created: List[Dict[str, Any]] = []
+    created = []
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
-        for target in targets:
-            account = (target.get("account") or "").strip()
-            magic = (target.get("magic") or "").strip()
+        for t in targets:
+            account = (t.get("account") or "").strip()
+            magic = (t.get("magic") or "").strip()
             if not account or not magic:
                 continue
 
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO signal_deliveries(
-                    signal_id, account, magic, symbol, delivery_status,
-                    first_seen_utc, ack_utc, filled_utc, expire_utc,
-                    updated_utc, created_utc, ticket, error_message
-                )
-                VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)
-                """,
-                (
-                    signal_id,
-                    account,
-                    magic,
-                    symbol,
-                    now,
-                    now,
-                ),
+            cur.execute("""
+            INSERT OR IGNORE INTO signal_deliveries(
+                signal_id, account, magic, symbol, delivery_status,
+                first_seen_utc, ack_utc, filled_utc, expire_utc,
+                updated_utc, created_utc, ticket, error_message
             )
+            VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)
+            """, (
+                signal_id,
+                account,
+                magic,
+                symbol,
+                now,
+                now
+            ))
 
-            created.append(
-                {
-                    "signal_id": signal_id,
-                    "account": account,
-                    "magic": magic,
-                    "symbol": symbol,
-                }
-            )
+            created.append({
+                "signal_id": signal_id,
+                "account": account,
+                "magic": magic,
+                "symbol": symbol
+            })
 
-        cur.execute(
-            """
-            UPDATE signals
-            SET status = ?
-            WHERE id = ?
-            """,
-            ("distributed" if created else "pending", signal_id),
-        )
+        cur.execute("""
+        UPDATE signals
+        SET status = ?
+        WHERE id = ?
+        """, ("distributed" if created else "pending", signal_id))
 
         conn.commit()
         conn.close()
@@ -956,7 +1391,7 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
 @app.post("/tv")
 def tv_signal(
     data: TVSignalIn,
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
 ):
     expire_old_signals_and_deliveries()
 
@@ -973,18 +1408,18 @@ def tv_signal(
     payload_dict = data.payload or {}
     payload_dict["score"] = safe_float(data.score, 1.0)
 
+    payload_json = json.dumps(payload_dict, ensure_ascii=False)
     now = utc_iso()
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-            """,
-            (symbol, side, json.dumps(payload_dict, ensure_ascii=False), now, now),
-        )
+
+        cur.execute("""
+        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (symbol, side, payload_json, now, now))
+
         signal_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -998,7 +1433,7 @@ def tv_signal(
         "side": side,
         "created_utc": now,
         "deliveries_created": len(deliveries),
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -1007,42 +1442,23 @@ def get_latest_delivery_for_consumer(symbol: str, account: str, magic: Optional[
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT d.*, s.side, s.payload_json, s.updated_utc AS signal_updated_utc,
-                   s.created_utc AS signal_created_utc, s.status AS signal_status
-            FROM signal_deliveries d
-            JOIN signals s ON s.id = d.signal_id
-            WHERE d.symbol = ?
-              AND d.account = ?
-              AND d.magic = ?
-              AND d.delivery_status IN ('pending', 'delivered')
-            ORDER BY d.id DESC
-            LIMIT 1
-            """,
-            (symbol, account, magic),
-        )
+        cur.execute("""
+        SELECT d.*, s.side, s.payload_json, s.updated_utc AS signal_updated_utc, s.created_utc AS signal_created_utc, s.status AS signal_status
+        FROM signal_deliveries d
+        JOIN signals s ON s.id = d.signal_id
+        WHERE d.symbol = ?
+          AND d.account = ?
+          AND d.magic = ?
+          AND d.delivery_status IN ('pending', 'delivered')
+        ORDER BY d.id DESC
+        LIMIT 1
+        """, (symbol, account, magic))
         row = cur.fetchone()
         conn.close()
 
     if row:
         row["payload"] = load_signal_payload(row)
     return row
-
-
-def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
-    payload = signal_row.get("payload", {}) or {}
-    score = safe_float(payload.get("score"), 1.0)
-    gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
-
-    if gate_level == "RED":
-        return {"approved": False, "reason": "GATE_RED", "score": score}
-    if score < 0.60:
-        return {"approved": False, "reason": "SCORE_LT_0_60", "score": score}
-    if gate_level == "YELLOW" and score < 0.75:
-        return {"approved": False, "reason": "YELLOW_SCORE_LT_0_75", "score": score}
-
-    return {"approved": True, "reason": "APPROVED", "score": score}
 
 
 @app.get("/latest")
@@ -1067,7 +1483,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": True,
             "controls": controls,
-            "gate": gate_payload,
+            "gate": gate_payload
         }
 
     delivery = get_latest_delivery_for_consumer(symbol=symbol, account=account, magic=magic)
@@ -1079,7 +1495,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": False,
             "controls": controls,
-            "gate": gate_payload,
+            "gate": gate_payload
         }
 
     signal_created = parse_dt(delivery.get("signal_created_utc"))
@@ -1089,16 +1505,13 @@ def latest_signal(
             with DB_LOCK:
                 conn = get_conn()
                 cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE signal_deliveries
-                    SET delivery_status = 'expired',
-                        expire_utc = ?,
-                        updated_utc = ?
-                    WHERE id = ?
-                    """,
-                    (utc_iso(), utc_iso(), delivery["id"]),
-                )
+                cur.execute("""
+                UPDATE signal_deliveries
+                SET delivery_status = 'expired',
+                    expire_utc = ?,
+                    updated_utc = ?
+                WHERE id = ?
+                """, (utc_iso(), utc_iso(), delivery["id"]))
                 conn.commit()
                 conn.close()
 
@@ -1111,7 +1524,7 @@ def latest_signal(
                 "signal_age_sec": age_sec,
                 "symbol": symbol,
                 "controls": controls,
-                "gate": gate_payload,
+                "gate": gate_payload
             }
 
     signal_row = {
@@ -1125,6 +1538,7 @@ def latest_signal(
     }
 
     filter_result = signal_passes_filter(signal_row, gate_payload)
+
     if not filter_result["approved"]:
         return {
             "ok": True,
@@ -1139,10 +1553,11 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            },
+            }
         }
 
     execution_engine = compute_execution_engine(signal_row, gate_payload)
+
     if not execution_engine["approved"]:
         return {
             "ok": True,
@@ -1157,25 +1572,22 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            },
+            }
         }
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE signal_deliveries
-            SET delivery_status = CASE
-                    WHEN delivery_status = 'pending' THEN 'delivered'
-                    ELSE delivery_status
-                END,
-                first_seen_utc = COALESCE(first_seen_utc, ?),
-                updated_utc = ?
-            WHERE id = ?
-            """,
-            (utc_iso(), utc_iso(), delivery["id"]),
-        )
+        cur.execute("""
+        UPDATE signal_deliveries
+        SET delivery_status = CASE
+                WHEN delivery_status = 'pending' THEN 'delivered'
+                ELSE delivery_status
+            END,
+            first_seen_utc = COALESCE(first_seen_utc, ?),
+            updated_utc = ?
+        WHERE id = ?
+        """, (utc_iso(), utc_iso(), delivery["id"]))
         conn.commit()
         conn.close()
 
@@ -1202,7 +1614,7 @@ def latest_signal(
             "first_seen_utc": delivery.get("first_seen_utc"),
             "ack_utc": delivery.get("ack_utc"),
         },
-        "signal": signal_row,
+        "signal": signal_row
     }
 
 
@@ -1217,23 +1629,21 @@ def ack_signal(data: AckIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT d.*, s.updated_utc AS signal_updated_utc
-            FROM signal_deliveries d
-            JOIN signals s ON s.id = d.signal_id
-            WHERE d.symbol = ?
-              AND d.account = ?
-              AND d.magic = ?
-              AND s.updated_utc = ?
-              AND d.delivery_status IN ('pending', 'delivered')
-            ORDER BY d.id DESC
-            LIMIT 1
-            """,
-            (symbol, account, magic, data.updated_utc),
-        )
-        row = cur.fetchone()
 
+        cur.execute("""
+        SELECT d.*, s.updated_utc AS signal_updated_utc
+        FROM signal_deliveries d
+        JOIN signals s ON s.id = d.signal_id
+        WHERE d.symbol = ?
+          AND d.account = ?
+          AND d.magic = ?
+          AND s.updated_utc = ?
+          AND d.delivery_status IN ('pending', 'delivered')
+        ORDER BY d.id DESC
+        LIMIT 1
+        """, (symbol, account, magic, data.updated_utc))
+
+        row = cur.fetchone()
         if not row:
             conn.close()
             raise HTTPException(status_code=404, detail="Delivery not found")
@@ -1242,42 +1652,33 @@ def ack_signal(data: AckIn):
         signal_id = row["signal_id"]
         ack_time = utc_iso()
 
-        cur.execute(
-            """
-            UPDATE signal_deliveries
-            SET delivery_status = 'acked',
-                ack_utc = ?,
-                ticket = COALESCE(?, ticket),
-                updated_utc = ?
-            WHERE id = ?
-            """,
-            (ack_time, data.ticket, ack_time, delivery_id),
-        )
+        cur.execute("""
+        UPDATE signal_deliveries
+        SET delivery_status = 'acked',
+            ack_utc = ?,
+            ticket = COALESCE(?, ticket),
+            updated_utc = ?
+        WHERE id = ?
+        """, (ack_time, data.ticket, ack_time, delivery_id))
 
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc, delivery_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (signal_id, symbol, account, magic, ack_time, delivery_id),
-        )
+        cur.execute("""
+        INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc, delivery_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (signal_id, symbol, account, magic, ack_time, delivery_id))
 
-        cur.execute(
-            """
-            UPDATE signals
-            SET status = CASE
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM signal_deliveries d
-                    WHERE d.signal_id = signals.id
-                      AND d.delivery_status IN ('pending', 'delivered', 'acked')
-                ) THEN 'distributed'
-                ELSE 'closed'
-            END
-            WHERE id = ?
-            """,
-            (signal_id,),
-        )
+        cur.execute("""
+        UPDATE signals
+        SET status = CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM signal_deliveries d
+                WHERE d.signal_id = signals.id
+                  AND d.delivery_status IN ('pending', 'delivered', 'acked')
+            ) THEN 'distributed'
+            ELSE 'closed'
+        END
+        WHERE id = ?
+        """, (signal_id,))
 
         conn.commit()
         conn.close()
@@ -1288,19 +1689,14 @@ def ack_signal(data: AckIn):
         "delivery_id": delivery_id,
         "symbol": symbol,
         "account": account,
-        "magic": magic,
+        "magic": magic
     }
 
 
 # -------------------------------------------------------------------
 # DEALS + RISKS
 # -------------------------------------------------------------------
-def resolve_signal_id_for_deal(
-    account: Optional[str],
-    magic: Optional[str],
-    symbol: str,
-    explicit_signal_id: Optional[int],
-) -> Optional[int]:
+def resolve_signal_id_for_deal(account: Optional[str], magic: Optional[str], symbol: str, explicit_signal_id: Optional[int]) -> Optional[int]:
     if explicit_signal_id:
         return explicit_signal_id
 
@@ -1314,19 +1710,16 @@ def resolve_signal_id_for_deal(
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM signal_deliveries
-            WHERE account = ?
-              AND magic = ?
-              AND symbol = ?
-              AND delivery_status = 'acked'
-            ORDER BY ack_utc DESC, id DESC
-            LIMIT 1
-            """,
-            (account, magic, symbol),
-        )
+        cur.execute("""
+        SELECT *
+        FROM signal_deliveries
+        WHERE account = ?
+          AND magic = ?
+          AND symbol = ?
+          AND delivery_status = 'acked'
+        ORDER BY ack_utc DESC, id DESC
+        LIMIT 1
+        """, (account, magic, symbol))
         row = cur.fetchone()
         conn.close()
 
@@ -1343,88 +1736,80 @@ def post_deal(data: DealIn):
         account=data.account,
         magic=data.magic,
         symbol=symbol,
-        explicit_signal_id=data.signal_id,
+        explicit_signal_id=data.signal_id
     )
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO deals(
-                account, magic, symbol, side, ticket, volume,
-                entry_price, exit_price, sl, tp,
-                pnl, pnl_currency, commission, swap,
-                risk_amount, r_multiple, strategy,
-                deal_time_utc, created_utc, signal_id
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data.account,
-                data.magic,
-                symbol,
-                data.side,
-                data.ticket,
-                data.volume,
-                data.entry_price,
-                data.exit_price,
-                data.sl,
-                data.tp,
-                data.pnl,
-                data.pnl_currency,
-                data.commission,
-                data.swap,
-                data.risk_amount,
-                data.r_multiple,
-                data.strategy,
-                deal_time,
-                utc_iso(),
-                resolved_signal_id,
-            ),
+
+        cur.execute("""
+        INSERT INTO deals(
+            account, magic, symbol, side, ticket, volume,
+            entry_price, exit_price, sl, tp,
+            pnl, pnl_currency, commission, swap,
+            risk_amount, r_multiple, strategy,
+            deal_time_utc, created_utc, signal_id
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            symbol,
+            data.side,
+            data.ticket,
+            data.volume,
+            data.entry_price,
+            data.exit_price,
+            data.sl,
+            data.tp,
+            data.pnl,
+            data.pnl_currency,
+            data.commission,
+            data.swap,
+            data.risk_amount,
+            data.r_multiple,
+            data.strategy,
+            deal_time,
+            utc_iso(),
+            resolved_signal_id
+        ))
 
         if resolved_signal_id and data.account and data.magic:
-            cur.execute(
-                """
-                UPDATE signal_deliveries
-                SET delivery_status = 'filled',
-                    filled_utc = ?,
-                    ticket = COALESCE(?, ticket),
-                    updated_utc = ?
-                WHERE signal_id = ?
-                  AND account = ?
-                  AND magic = ?
-                  AND symbol = ?
-                  AND delivery_status IN ('acked', 'delivered', 'pending')
-                """,
-                (
-                    utc_iso(),
-                    data.ticket,
-                    utc_iso(),
-                    resolved_signal_id,
-                    data.account,
-                    data.magic,
-                    symbol,
-                ),
-            )
+            cur.execute("""
+            UPDATE signal_deliveries
+            SET delivery_status = 'filled',
+                filled_utc = ?,
+                ticket = COALESCE(?, ticket),
+                updated_utc = ?
+            WHERE signal_id = ?
+              AND account = ?
+              AND magic = ?
+              AND symbol = ?
+              AND delivery_status IN ('acked', 'delivered', 'pending')
+            """, (
+                utc_iso(),
+                data.ticket,
+                utc_iso(),
+                resolved_signal_id,
+                data.account,
+                data.magic,
+                symbol
+            ))
 
-            cur.execute(
-                """
-                UPDATE signals
-                SET status = CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM signal_deliveries d
-                        WHERE d.signal_id = signals.id
-                          AND d.delivery_status IN ('pending', 'delivered', 'acked')
-                    ) THEN 'distributed'
-                    ELSE 'closed'
-                END
-                WHERE id = ?
-                """,
-                (resolved_signal_id,),
-            )
+            cur.execute("""
+            UPDATE signals
+            SET status = CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM signal_deliveries d
+                    WHERE d.signal_id = signals.id
+                      AND d.delivery_status IN ('pending', 'delivered', 'acked')
+                ) THEN 'distributed'
+                ELSE 'closed'
+            END
+            WHERE id = ?
+            """, (resolved_signal_id,))
 
         conn.commit()
         conn.close()
@@ -1437,22 +1822,21 @@ def post_risk(data: RiskIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data.account,
-                data.magic,
-                data.symbol.upper(),
-                data.event_type,
-                data.level,
-                data.message,
-                data.value,
-                utc_iso(),
-            ),
-        )
+
+        cur.execute("""
+        INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.event_type,
+            data.level,
+            data.message,
+            data.value,
+            utc_iso()
+        ))
+
         conn.commit()
         conn.close()
 
@@ -1468,7 +1852,7 @@ def get_deals_filtered(
     magic: Optional[str] = None,
     lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
     limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-) -> List[Dict[str, Any]]:
+):
     dt_from = now_utc() - timedelta(days=lookback_days)
 
     query = """
@@ -1476,14 +1860,16 @@ def get_deals_filtered(
     FROM deals
     WHERE deal_time_utc >= ?
     """
-    params: List[Any] = [utc_iso(dt_from)]
+    params = [utc_iso(dt_from)]
 
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
+
     if account:
         query += " AND account = ?"
         params.append(account)
+
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1498,14 +1884,15 @@ def get_deals_filtered(
         rows = cur.fetchall()
         conn.close()
 
-    return list(reversed(rows))
+    rows = list(reversed(rows))
+    return rows
 
 
 def get_deals_today(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
     magic: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+):
     dt_from = utc_day_start()
 
     query = """
@@ -1513,14 +1900,16 @@ def get_deals_today(
     FROM deals
     WHERE deal_time_utc >= ?
     """
-    params: List[Any] = [utc_iso(dt_from)]
+    params = [utc_iso(dt_from)]
 
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
+
     if account:
         query += " AND account = ?"
         params.append(account)
+
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1540,19 +1929,22 @@ def get_deals_today(
 def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
     curve = [0.0]
     running = 0.0
-    for row in rows:
-        running += safe_float(row.get("pnl"), 0.0)
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        running += pnl
         curve.append(running)
     return curve
 
 
 def calc_max_drawdown_abs(curve: List[float]) -> float:
-    peak = float("-inf")
+    peak = -10**18
     max_dd = 0.0
     for x in curve:
         if x > peak:
             peak = x
-        max_dd = max(max_dd, peak - x)
+        dd = peak - x
+        if dd > max_dd:
+            max_dd = dd
     return max_dd
 
 
@@ -1564,15 +1956,16 @@ def calc_max_drawdown_pct(curve: List[float]) -> float:
             peak = x
         if peak and peak > 0:
             dd_pct = ((peak - x) / peak) * 100.0
-            max_dd_pct = max(max_dd_pct, dd_pct)
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
     return max_dd_pct
 
 
 def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     max_streak = 0
-    for row in rows:
-        pnl = safe_float(row.get("pnl"), 0.0)
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
         if pnl < 0:
             streak += 1
             max_streak = max(max_streak, streak)
@@ -1583,8 +1976,8 @@ def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
 
 def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
-    for row in reversed(rows):
-        pnl = safe_float(row.get("pnl"), 0.0)
+    for r in reversed(rows):
+        pnl = safe_float(r.get("pnl"), 0.0)
         if pnl < 0:
             streak += 1
         else:
@@ -1597,14 +1990,15 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = 0
     losses = 0
     breakeven = 0
+
     gross_profit = 0.0
     gross_loss = 0.0
     net_pnl = 0.0
     total_r = 0.0
 
-    for row in rows:
-        pnl = safe_float(row.get("pnl"), 0.0)
-        r_mult = safe_float(row.get("r_multiple"), 0.0)
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        r_mult = safe_float(r.get("r_multiple"), 0.0)
 
         net_pnl += pnl
         total_r += r_mult
@@ -1628,6 +2022,7 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_dd_pct = calc_max_drawdown_pct(curve)
     max_loss_streak = calc_loss_streak(rows)
     current_loss_streak = calc_current_loss_streak(rows)
+
     last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
@@ -1657,11 +2052,11 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": DEFAULT_GATE_LEVEL,
             "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
             "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"],
+            "reasons": ["AUTO_GATE_DISABLED"]
         }
 
-    reasons_red: List[str] = []
-    reasons_yellow: List[str] = []
+    reasons_red = []
+    reasons_yellow = []
 
     dd_pct = safe_float(kpi.get("max_drawdown_pct"))
     cur_loss_streak = safe_int(kpi.get("current_loss_streak"))
@@ -1671,10 +2066,13 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
 
     if dd_pct >= RED_DD_PCT:
         reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
+
     if cur_loss_streak >= RED_LOSS_STREAK:
         reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
+
     if sum_r <= RED_R_SUM:
         reasons_red.append(f"SUM_R<={RED_R_SUM}")
+
     if total_trades >= 5 and winrate < RED_WINRATE_MIN:
         reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
 
@@ -1683,15 +2081,18 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "RED",
             "allow_new_entries": False,
             "risk_multiplier": 0.0,
-            "reasons": reasons_red,
+            "reasons": reasons_red
         }
 
     if dd_pct >= YELLOW_DD_PCT:
         reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
+
     if cur_loss_streak >= YELLOW_LOSS_STREAK:
         reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
+
     if sum_r <= YELLOW_R_SUM:
         reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
+
     if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
         reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
 
@@ -1700,14 +2101,14 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "YELLOW",
             "allow_new_entries": True,
             "risk_multiplier": 0.5,
-            "reasons": reasons_yellow,
+            "reasons": reasons_yellow
         }
 
     return {
         "gate_level": "GREEN",
         "allow_new_entries": True,
         "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"],
+        "reasons": ["NORMAL"]
     }
 
 
@@ -1723,13 +2124,15 @@ def compute_auto_gate(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
+
     kpis = summarize_kpis(rows)
     gate = auto_gate_from_kpis(kpis)
+
     return {
         "kpis": kpis,
-        "gate": gate,
+        "gate": gate
     }
 
 
@@ -1747,11 +2150,11 @@ def compute_risk_engine(
     daily_r = 0.0
     total_trades = len(rows)
 
-    for row in rows:
-        daily_pnl += safe_float(row.get("pnl"), 0.0)
-        daily_r += safe_float(row.get("r_multiple"), 0.0)
+    for r in rows:
+        daily_pnl += safe_float(r.get("pnl"), 0.0)
+        daily_r += safe_float(r.get("r_multiple"), 0.0)
 
-    reasons: List[str] = []
+    reasons = []
     allow_new_entries = True
     level = "GREEN"
 
@@ -1768,7 +2171,7 @@ def compute_risk_engine(
                 "daily_r_cap": DAILY_R_CAP,
                 "daily_max_trades": DAILY_MAX_TRADES,
             },
-            "reasons": ["RISK_ENGINE_DISABLED"],
+            "reasons": ["RISK_ENGINE_DISABLED"]
         }
 
     if daily_pnl <= -abs(DAILY_LOSS_CAP_USD):
@@ -1801,7 +2204,7 @@ def compute_risk_engine(
             "daily_r_cap": DAILY_R_CAP,
             "daily_max_trades": DAILY_MAX_TRADES,
         },
-        "reasons": reasons,
+        "reasons": reasons
     }
 
 
@@ -1814,10 +2217,11 @@ def compute_execution_engine(
 ) -> Dict[str, Any]:
     payload = (signal_row or {}).get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
+
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     mode = EXECUTION_MODE
-    reasons: List[str] = []
+    reasons = []
     risk_multiplier = RISK_MULTIPLIER_NORMAL
     priority = "NORMAL"
 
@@ -1829,7 +2233,7 @@ def compute_execution_engine(
             "priority": "BLOCKED",
             "risk_multiplier": 0.0,
             "approved": False,
-            "reasons": ["GATE_RED"],
+            "reasons": ["GATE_RED"]
         }
 
     if not SCORE_TO_RISK_ENABLED:
@@ -1840,17 +2244,19 @@ def compute_execution_engine(
             "priority": "NORMAL",
             "risk_multiplier": RISK_MULTIPLIER_NORMAL,
             "approved": True,
-            "reasons": ["SCORE_TO_RISK_DISABLED"],
+            "reasons": ["SCORE_TO_RISK_DISABLED"]
         }
 
     if mode == "safe":
         risk_multiplier = min(RISK_MULTIPLIER_LOW, RISK_MULTIPLIER_NORMAL)
         priority = "LOW"
         reasons.append("MODE_SAFE")
+
     elif mode == "normal":
         risk_multiplier = RISK_MULTIPLIER_NORMAL
         priority = "NORMAL"
         reasons.append("MODE_NORMAL")
+
     elif mode == "aggressive":
         if score >= SCORE_HIGH_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_HIGH
@@ -1860,6 +2266,7 @@ def compute_execution_engine(
             risk_multiplier = RISK_MULTIPLIER_NORMAL
             priority = "NORMAL"
             reasons.append("MODE_AGGRESSIVE_NORMAL_SCORE")
+
     else:
         if score < SCORE_LOW_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_LOW
@@ -1873,6 +2280,7 @@ def compute_execution_engine(
             risk_multiplier = RISK_MULTIPLIER_NORMAL
             priority = "NORMAL"
             reasons.append("MID_SCORE_RANGE")
+
         reasons.append("MODE_DYNAMIC")
 
     if gate_level == "YELLOW":
@@ -1886,7 +2294,7 @@ def compute_execution_engine(
         "priority": priority,
         "risk_multiplier": round(risk_multiplier, 4),
         "approved": True,
-        "reasons": reasons,
+        "reasons": reasons
     }
 
 
@@ -1896,11 +2304,11 @@ def compute_execution_engine(
 @app.get("/controls/effective")
 def controls_effective(
     symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard),
+    _: bool = Depends(app_token_guard)
 ):
     return {
         "ok": True,
-        "controls": get_runtime_controls(symbol),
+        "controls": get_runtime_controls(symbol)
     }
 
 
@@ -1917,7 +2325,7 @@ def gate_auto(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     return {
@@ -1930,7 +2338,7 @@ def gate_auto(
             "limit_trades": limit_trades,
         },
         "kpis": result["kpis"],
-        "gate": result["gate"],
+        "gate": result["gate"]
     }
 
 
@@ -1948,7 +2356,7 @@ def status_risk_engine(
             "account": account,
             "magic": magic,
         },
-        "risk_engine": result,
+        "risk_engine": result
     }
 
 
@@ -1957,17 +2365,24 @@ def status_execution_engine(
     score: float = Query(default=1.0),
     gate_level: str = Query(default="GREEN"),
 ):
-    dummy_signal = {"payload": {"score": score}}
-    dummy_gate = {"gate_level": gate_level.upper()}
+    dummy_signal = {
+        "payload": {
+            "score": score
+        }
+    }
+    dummy_gate = {
+        "gate_level": gate_level.upper()
+    }
+
     result = compute_execution_engine(dummy_signal, dummy_gate)
 
     return {
         "ok": True,
         "input": {
             "score": score,
-            "gate_level": gate_level.upper(),
+            "gate_level": gate_level.upper()
         },
-        "execution_engine": result,
+        "execution_engine": result
     }
 
 
@@ -1991,10 +2406,12 @@ def gate_combo(
     final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
 
     gate_level = auto_gate["gate_level"]
-    if paused or not risk_allow:
+    if paused:
+        gate_level = "RED"
+    if not risk_allow:
         gate_level = "RED"
 
-    reasons: List[str] = []
+    reasons = []
     if paused:
         reasons.append("PAUSED")
     if not controls_allow:
@@ -2013,7 +2430,7 @@ def gate_combo(
         "controls": controls,
         "auto_gate": auto_gate,
         "risk_engine": risk_engine,
-        "reasons": reasons,
+        "reasons": reasons
     }
 
 
@@ -2033,8 +2450,10 @@ def rolling_kpis(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
+
+    kpis = summarize_kpis(rows)
 
     return {
         "ok": True,
@@ -2045,7 +2464,7 @@ def rolling_kpis(
             "lookback_days": lookback_days,
             "limit_trades": limit_trades,
         },
-        "kpis": summarize_kpis(rows),
+        "kpis": kpis
     }
 
 
@@ -2064,7 +2483,7 @@ def system_overview(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     kpis = summarize_kpis(rows)
@@ -2073,7 +2492,10 @@ def system_overview(
 
     heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
-        heartbeat_payload = heartbeat_status(symbol=symbol) if symbol else heartbeat_status()
+        if symbol:
+            heartbeat_payload = heartbeat_status(symbol=symbol)
+        else:
+            heartbeat_payload = heartbeat_status()
     except Exception:
         pass
 
@@ -2091,7 +2513,7 @@ def system_overview(
         "controls": get_runtime_controls(symbol),
         "kpis": kpis,
         "gate": gate,
-        "risk_engine": risk_engine,
+        "risk_engine": risk_engine
     }
 
 
@@ -2106,39 +2528,35 @@ def debug_state(symbol: str = Query(...)):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM signals
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            (symbol,),
-        )
+
+        cur.execute("""
+        SELECT *
+        FROM signals
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 10
+        """, (symbol,))
         signals = cur.fetchall()
 
-        cur.execute(
-            """
-            SELECT *
-            FROM signal_deliveries
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 100
-            """,
-            (symbol,),
-        )
+        cur.execute("""
+        SELECT *
+        FROM signal_deliveries
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 100
+        """, (symbol,))
         deliveries = cur.fetchall()
+
         conn.close()
 
-    for item in signals:
-        item["payload"] = load_signal_payload(item)
+    for s in signals:
+        s["payload"] = load_signal_payload(s)
 
     return {
         "ok": True,
         "symbol": symbol,
         "signals": signals,
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -2157,7 +2575,7 @@ def debug_recent_acks(
         FROM signal_acks
         WHERE 1=1
         """
-        params: List[Any] = []
+        params = []
 
         if symbol:
             query += " AND symbol = ?"
@@ -2177,7 +2595,7 @@ def debug_recent_acks(
     return {
         "ok": True,
         "count": len(rows),
-        "items": rows,
+        "items": rows
     }
 
 
@@ -2190,16 +2608,14 @@ def debug_delivery_status(signal_id: int = Query(...)):
         cur.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
         signal_row = cur.fetchone()
 
-        cur.execute(
-            """
-            SELECT *
-            FROM signal_deliveries
-            WHERE signal_id = ?
-            ORDER BY symbol, account, magic
-            """,
-            (signal_id,),
-        )
+        cur.execute("""
+        SELECT *
+        FROM signal_deliveries
+        WHERE signal_id = ?
+        ORDER BY symbol, account, magic
+        """, (signal_id,))
         deliveries = cur.fetchall()
+
         conn.close()
 
     if not signal_row:
@@ -2211,7 +2627,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
         "ok": True,
         "signal": signal_row,
         "delivery_count": len(deliveries),
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -2219,33 +2635,33 @@ def debug_delivery_status(signal_id: int = Query(...)):
 def debug_pending_by_consumer(
     account: str = Query(...),
     magic: str = Query(...),
-    symbol: str = Query(...),
+    symbol: str = Query(...)
 ):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT d.*, s.side, s.payload_json, s.created_utc AS signal_created_utc, s.updated_utc AS signal_updated_utc
-            FROM signal_deliveries d
-            JOIN signals s ON s.id = d.signal_id
-            WHERE d.account = ?
-              AND d.magic = ?
-              AND d.symbol = ?
-              AND d.delivery_status IN ('pending', 'delivered', 'acked')
-            ORDER BY d.id DESC
-            LIMIT 50
-            """,
-            (account, magic, symbol.upper()),
-        )
+        cur.execute("""
+        SELECT d.*, s.side, s.payload_json, s.created_utc AS signal_created_utc, s.updated_utc AS signal_updated_utc
+        FROM signal_deliveries d
+        JOIN signals s ON s.id = d.signal_id
+        WHERE d.account = ?
+          AND d.magic = ?
+          AND d.symbol = ?
+          AND d.delivery_status IN ('pending', 'delivered', 'acked')
+        ORDER BY d.id DESC
+        LIMIT 50
+        """, (account, magic, symbol.upper()))
         rows = cur.fetchall()
         conn.close()
 
-    for row in rows:
-        row["payload"] = load_signal_payload(row)
+    for r in rows:
+        try:
+            r["payload"] = json.loads(r.get("payload_json") or "{}")
+        except Exception:
+            r["payload"] = {}
 
     return {
         "ok": True,
         "count": len(rows),
-        "items": rows,
+        "items": rows
     }
