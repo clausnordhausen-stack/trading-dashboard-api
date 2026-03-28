@@ -88,13 +88,11 @@ RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 AUTHORIZED_CONSUMERS_STRICT = os.getenv("AUTHORIZED_CONSUMERS_STRICT", "false").lower() == "true"
 
 # OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "false").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4").strip()
-OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "true").lower() == "true"
 
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
 
 # -------------------------------------------------------------------
 # HELPERS
@@ -199,7 +197,7 @@ def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
         "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
         "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
         "symbol": symbol.upper() if symbol else None,
-        "source": "default_env",
+        "source": "default_env"
     }
 
 
@@ -243,13 +241,39 @@ def dt_or_none(value: Optional[str]) -> Optional[str]:
 
 @lru_cache(maxsize=1)
 def get_openai_client() -> OpenAI:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
-    return OpenAI(api_key=OPENAI_API_KEY)
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=api_key)
 
 
-def ai_is_enabled() -> bool:
-    return OPENAI_ENABLED and bool(OPENAI_API_KEY)
+def extract_response_text(resp: Any) -> str:
+    try:
+        output_text = getattr(resp, "output_text", None)
+        if output_text:
+            return output_text.strip()
+    except Exception:
+        pass
+
+    try:
+        output = getattr(resp, "output", None) or []
+        parts: List[str] = []
+        for item in output:
+            contents = getattr(item, "content", None) or []
+            for c in contents:
+                text_value = getattr(c, "text", None)
+                if text_value:
+                    parts.append(text_value)
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+def safe_json_loads(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
 
 
 # -------------------------------------------------------------------
@@ -491,16 +515,35 @@ def build_me_payload(user: Dict[str, Any]) -> Dict[str, Any]:
 def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = signal_row.get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
+
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     if gate_level == "RED":
-        return {"approved": False, "reason": "GATE_RED", "score": score}
-    if score < 0.60:
-        return {"approved": False, "reason": "SCORE_LT_0_60", "score": score}
-    if gate_level == "YELLOW" and score < 0.75:
-        return {"approved": False, "reason": "YELLOW_SCORE_LT_0_75", "score": score}
+        return {
+            "approved": False,
+            "reason": "GATE_RED",
+            "score": score
+        }
 
-    return {"approved": True, "reason": "APPROVED", "score": score}
+    if score < 0.60:
+        return {
+            "approved": False,
+            "reason": "SCORE_LT_0_60",
+            "score": score
+        }
+
+    if gate_level == "YELLOW" and score < 0.75:
+        return {
+            "approved": False,
+            "reason": "YELLOW_SCORE_LT_0_75",
+            "score": score
+        }
+
+    return {
+        "approved": True,
+        "reason": "APPROVED",
+        "score": score
+    }
 
 
 def expire_old_signals_and_deliveries():
@@ -877,7 +920,6 @@ def seed_auth_data():
 
 init_db()
 
-
 # -------------------------------------------------------------------
 # MODELS
 # -------------------------------------------------------------------
@@ -962,22 +1004,30 @@ class ConsumerUpsertIn(BaseModel):
     notes: Optional[str] = None
 
 
-class AISystemReviewIn(BaseModel):
-    symbol: Optional[str] = None
+class AIDecisionIn(BaseModel):
+    symbol: str
+    side: str
+    score: Optional[float] = 1.0
     account: Optional[str] = None
     magic: Optional[str] = None
-    lookback_days: int = 7
-    limit_trades: int = 50
-    operator_focus: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
 
 
-class AISystemReviewOut(BaseModel):
+class AIDecisionOut(BaseModel):
     ok: bool
-    model: str
-    generated_utc: str
-    input_filters: Dict[str, Any]
-    review: Dict[str, Any]
-    source_snapshot: Dict[str, Any]
+    ai_enabled: bool
+    symbol: str
+    side: str
+    model: Optional[str] = None
+    gate_level: Optional[str] = None
+    allow_new_entries: Optional[bool] = None
+    risk_level: Optional[str] = None
+    approved: bool
+    confidence: float
+    risk_mode: str
+    action: str
+    reason: str
+    raw_text: Optional[str] = None
 
 
 # -------------------------------------------------------------------
@@ -1010,7 +1060,7 @@ def login(data: LoginRequest):
     )
     return {
         "access_token": access_token,
-        "token_type": "bearer",
+        "token_type": "bearer"
     }
 
 
@@ -1019,12 +1069,144 @@ def me(current_user: dict = Depends(get_current_user)):
     return build_me_payload(current_user)
 
 
+@app.post("/ai/decision", response_model=AIDecisionOut)
+def ai_decision(data: AIDecisionIn):
+    symbol = data.symbol.strip().upper()
+    side = normalize_side(data.side)
+    score = safe_float(data.score, 1.0)
+
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail="side must be BUY or SELL")
+
+    gate = gate_combo(symbol=symbol, account=data.account, magic=data.magic)
+    risk_engine = compute_risk_engine(symbol=symbol, account=data.account, magic=data.magic)
+
+    fallback_approved = bool(gate.get("allow_new_entries", False)) and score >= 0.60
+    fallback_action = "ALLOW" if fallback_approved else "BLOCK"
+
+    if not OPENAI_ENABLED:
+        return {
+            "ok": True,
+            "ai_enabled": False,
+            "symbol": symbol,
+            "side": side,
+            "model": None,
+            "gate_level": gate.get("gate_level"),
+            "allow_new_entries": gate.get("allow_new_entries"),
+            "risk_level": risk_engine.get("risk_level"),
+            "approved": fallback_approved,
+            "confidence": round(max(0.0, min(1.0, score)), 4),
+            "risk_mode": "fallback",
+            "action": fallback_action,
+            "reason": "OpenAI disabled, fallback decision used",
+            "raw_text": None,
+        }
+
+    system_prompt = """
+You are a trading decision support engine.
+You do NOT place trades.
+You evaluate whether a signal should be allowed, reduced, or blocked.
+
+Return ONLY valid JSON with these exact keys:
+approved
+confidence
+risk_mode
+action
+reason
+
+Rules:
+- approved must be true or false
+- confidence must be a number from 0.0 to 1.0
+- risk_mode must be one of: block, reduced, normal, aggressive
+- action must be one of: BLOCK, ALLOW, REDUCE
+- reason must be a short clear sentence
+- If gate_level is RED or allow_new_entries is false, action should normally be BLOCK
+- If risk_level is RED, action should normally be BLOCK
+- Consider score, gate state, risk state, and context together
+"""
+
+    user_payload = {
+        "symbol": symbol,
+        "side": side,
+        "score": score,
+        "gate": gate,
+        "risk_engine": risk_engine,
+        "context": data.context or {},
+    }
+
+    try:
+        client = get_openai_client()
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        )
+
+        raw_text = extract_response_text(resp)
+        parsed = safe_json_loads(raw_text)
+
+        approved = bool(parsed.get("approved", fallback_approved))
+        confidence = safe_float(parsed.get("confidence"), score)
+        risk_mode = str(parsed.get("risk_mode", "normal")).strip().lower()
+        action = str(parsed.get("action", fallback_action)).strip().upper()
+        reason = str(parsed.get("reason", "AI decision generated")).strip()
+
+        if risk_mode not in ("block", "reduced", "normal", "aggressive"):
+            risk_mode = "normal"
+
+        if action not in ("BLOCK", "ALLOW", "REDUCE"):
+            action = fallback_action
+
+        return {
+            "ok": True,
+            "ai_enabled": True,
+            "symbol": symbol,
+            "side": side,
+            "model": OPENAI_MODEL,
+            "gate_level": gate.get("gate_level"),
+            "allow_new_entries": gate.get("allow_new_entries"),
+            "risk_level": risk_engine.get("risk_level"),
+            "approved": approved,
+            "confidence": round(max(0.0, min(1.0, confidence)), 4),
+            "risk_mode": risk_mode,
+            "action": action,
+            "reason": reason,
+            "raw_text": raw_text or None,
+        }
+
+    except Exception as e:
+        return {
+            "ok": True,
+            "ai_enabled": True,
+            "symbol": symbol,
+            "side": side,
+            "model": OPENAI_MODEL,
+            "gate_level": gate.get("gate_level"),
+            "allow_new_entries": gate.get("allow_new_entries"),
+            "risk_level": risk_engine.get("risk_level"),
+            "approved": fallback_approved,
+            "confidence": round(max(0.0, min(1.0, score)), 4),
+            "risk_mode": "fallback",
+            "action": fallback_action,
+            "reason": f"AI fallback used: {str(e)}",
+            "raw_text": None,
+        }
+
+
 @app.get("/master/customers")
 def master_customers(current_user: dict = Depends(require_master)):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM customers ORDER BY id ASC")
+        cur.execute(
+            """
+            SELECT *
+            FROM customers
+            ORDER BY id ASC
+            """
+        )
         rows = cur.fetchall()
         conn.close()
 
@@ -1061,7 +1243,11 @@ def master_customers(current_user: dict = Depends(require_master)):
             "strategies": get_customer_strategies(customer_id),
         })
 
-    return {"ok": True, "count": len(items), "items": items}
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
 
 
 # -------------------------------------------------------------------
@@ -1074,7 +1260,8 @@ def root():
         "service": "Signal Agent API",
         "version": "11.1.0",
         "server_time_utc": utc_iso(),
-        "openai_enabled": ai_is_enabled(),
+        "openai_enabled": OPENAI_ENABLED,
+        "openai_model": OPENAI_MODEL,
     }
 
 
@@ -1084,8 +1271,7 @@ def health():
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "time": utc_iso(),
-        "openai_enabled": ai_is_enabled(),
+        "time": utc_iso()
     }
 
 
@@ -1152,7 +1338,7 @@ def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
                 "symbol": hb_symbol,
                 "enabled": 1,
                 "owner_name": r.get("owner_name"),
-                "notes": "heartbeat_fallback",
+                "notes": "heartbeat_fallback"
             })
 
     unique_map = {}
@@ -1183,13 +1369,17 @@ def resolve_target_consumers(symbol: str) -> List[Dict[str, Any]]:
 @app.get("/consumers")
 def consumers(symbol: Optional[str] = Query(default=None)):
     items = list_authorized_consumers(symbol=symbol)
-    return {"ok": True, "count": len(items), "items": items}
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items
+    }
 
 
 @app.post("/consumers/upsert")
 def consumers_upsert(
     data: ConsumerUpsertIn,
-    _: bool = Depends(app_token_guard),
+    _: bool = Depends(app_token_guard)
 ):
     symbol = data.symbol.strip().upper()
     account = data.account.strip()
@@ -1218,7 +1408,7 @@ def consumers_upsert(
             data.owner_name,
             data.notes,
             now,
-            now,
+            now
         ))
         conn.commit()
         conn.close()
@@ -1228,7 +1418,7 @@ def consumers_upsert(
         "account": account,
         "magic": magic,
         "symbol": symbol,
-        "enabled": data.enabled,
+        "enabled": data.enabled
     }
 
 
@@ -1246,6 +1436,7 @@ def heartbeat(data: HeartbeatPing):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1258,12 +1449,18 @@ def heartbeat(data: HeartbeatPing):
             now,
             data.status,
             data.comment,
-            data.owner_name,
+            data.owner_name
         ))
+
         conn.commit()
         conn.close()
 
     return {"ok": True, "server_time_utc": now}
+
+
+@app.post("/heartbeat")
+def heartbeat_alias(data: HeartbeatPing):
+    return heartbeat(data)
 
 
 @app.get("/status/heartbeat")
@@ -1324,7 +1521,7 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
         "ok": True,
         "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
         "connected_count": connected_count,
-        "items": result,
+        "items": result
     }
 
 
@@ -1335,6 +1532,7 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
     symbol = symbol.upper()
     targets = resolve_target_consumers(symbol)
     now = utc_iso()
+
     created = []
 
     with DB_LOCK:
@@ -1360,14 +1558,14 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
                 magic,
                 symbol,
                 now,
-                now,
+                now
             ))
 
             created.append({
                 "signal_id": signal_id,
                 "account": account,
                 "magic": magic,
-                "symbol": symbol,
+                "symbol": symbol
             })
 
         cur.execute("""
@@ -1385,7 +1583,7 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
 @app.post("/tv")
 def tv_signal(
     data: TVSignalIn,
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
 ):
     expire_old_signals_and_deliveries()
 
@@ -1408,10 +1606,12 @@ def tv_signal(
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
         VALUES (?, ?, ?, ?, ?, 'pending')
         """, (symbol, side, payload_json, now, now))
+
         signal_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -1425,7 +1625,7 @@ def tv_signal(
         "side": side,
         "created_utc": now,
         "deliveries_created": len(deliveries),
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -1475,7 +1675,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": True,
             "controls": controls,
-            "gate": gate_payload,
+            "gate": gate_payload
         }
 
     delivery = get_latest_delivery_for_consumer(symbol=symbol, account=account, magic=magic)
@@ -1487,7 +1687,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": False,
             "controls": controls,
-            "gate": gate_payload,
+            "gate": gate_payload
         }
 
     signal_created = parse_dt(delivery.get("signal_created_utc"))
@@ -1516,7 +1716,7 @@ def latest_signal(
                 "signal_age_sec": age_sec,
                 "symbol": symbol,
                 "controls": controls,
-                "gate": gate_payload,
+                "gate": gate_payload
             }
 
     signal_row = {
@@ -1545,7 +1745,7 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            },
+            }
         }
 
     execution_engine = compute_execution_engine(signal_row, gate_payload)
@@ -1564,7 +1764,7 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            },
+            }
         }
 
     with DB_LOCK:
@@ -1606,7 +1806,7 @@ def latest_signal(
             "first_seen_utc": delivery.get("first_seen_utc"),
             "ack_utc": delivery.get("ack_utc"),
         },
-        "signal": signal_row,
+        "signal": signal_row
     }
 
 
@@ -1681,7 +1881,7 @@ def ack_signal(data: AckIn):
         "delivery_id": delivery_id,
         "symbol": symbol,
         "account": account,
-        "magic": magic,
+        "magic": magic
     }
 
 
@@ -1728,7 +1928,7 @@ def post_deal(data: DealIn):
         account=data.account,
         magic=data.magic,
         symbol=symbol,
-        explicit_signal_id=data.signal_id,
+        explicit_signal_id=data.signal_id
     )
 
     with DB_LOCK:
@@ -1764,7 +1964,7 @@ def post_deal(data: DealIn):
             data.strategy,
             deal_time,
             utc_iso(),
-            resolved_signal_id,
+            resolved_signal_id
         ))
 
         if resolved_signal_id and data.account and data.magic:
@@ -1786,7 +1986,7 @@ def post_deal(data: DealIn):
                 resolved_signal_id,
                 data.account,
                 data.magic,
-                symbol,
+                symbol
             ))
 
             cur.execute("""
@@ -1814,6 +2014,7 @@ def post_risk(data: RiskIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
         INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1825,8 +2026,9 @@ def post_risk(data: RiskIn):
             data.level,
             data.message,
             data.value,
-            utc_iso(),
+            utc_iso()
         ))
+
         conn.commit()
         conn.close()
 
@@ -1855,9 +2057,11 @@ def get_deals_filtered(
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
+
     if account:
         query += " AND account = ?"
         params.append(account)
+
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1892,9 +2096,11 @@ def get_deals_today(
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
+
     if account:
         query += " AND account = ?"
         params.append(account)
+
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1974,6 +2180,7 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = 0
     losses = 0
     breakeven = 0
+
     gross_profit = 0.0
     gross_loss = 0.0
     net_pnl = 0.0
@@ -2005,6 +2212,7 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_dd_pct = calc_max_drawdown_pct(curve)
     max_loss_streak = calc_loss_streak(rows)
     current_loss_streak = calc_current_loss_streak(rows)
+
     last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
@@ -2034,7 +2242,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": DEFAULT_GATE_LEVEL,
             "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
             "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"],
+            "reasons": ["AUTO_GATE_DISABLED"]
         }
 
     reasons_red = []
@@ -2060,7 +2268,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "RED",
             "allow_new_entries": False,
             "risk_multiplier": 0.0,
-            "reasons": reasons_red,
+            "reasons": reasons_red
         }
 
     if dd_pct >= YELLOW_DD_PCT:
@@ -2077,14 +2285,14 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "YELLOW",
             "allow_new_entries": True,
             "risk_multiplier": 0.5,
-            "reasons": reasons_yellow,
+            "reasons": reasons_yellow
         }
 
     return {
         "gate_level": "GREEN",
         "allow_new_entries": True,
         "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"],
+        "reasons": ["NORMAL"]
     }
 
 
@@ -2100,13 +2308,16 @@ def compute_auto_gate(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     kpis = summarize_kpis(rows)
     gate = auto_gate_from_kpis(kpis)
 
-    return {"kpis": kpis, "gate": gate}
+    return {
+        "kpis": kpis,
+        "gate": gate
+    }
 
 
 # -------------------------------------------------------------------
@@ -2144,7 +2355,7 @@ def compute_risk_engine(
                 "daily_r_cap": DAILY_R_CAP,
                 "daily_max_trades": DAILY_MAX_TRADES,
             },
-            "reasons": ["RISK_ENGINE_DISABLED"],
+            "reasons": ["RISK_ENGINE_DISABLED"]
         }
 
     if daily_pnl <= -abs(DAILY_LOSS_CAP_USD):
@@ -2177,7 +2388,7 @@ def compute_risk_engine(
             "daily_r_cap": DAILY_R_CAP,
             "daily_max_trades": DAILY_MAX_TRADES,
         },
-        "reasons": reasons,
+        "reasons": reasons
     }
 
 
@@ -2190,6 +2401,7 @@ def compute_execution_engine(
 ) -> Dict[str, Any]:
     payload = (signal_row or {}).get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
+
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     mode = EXECUTION_MODE
@@ -2205,7 +2417,7 @@ def compute_execution_engine(
             "priority": "BLOCKED",
             "risk_multiplier": 0.0,
             "approved": False,
-            "reasons": ["GATE_RED"],
+            "reasons": ["GATE_RED"]
         }
 
     if not SCORE_TO_RISK_ENABLED:
@@ -2216,17 +2428,19 @@ def compute_execution_engine(
             "priority": "NORMAL",
             "risk_multiplier": RISK_MULTIPLIER_NORMAL,
             "approved": True,
-            "reasons": ["SCORE_TO_RISK_DISABLED"],
+            "reasons": ["SCORE_TO_RISK_DISABLED"]
         }
 
     if mode == "safe":
         risk_multiplier = min(RISK_MULTIPLIER_LOW, RISK_MULTIPLIER_NORMAL)
         priority = "LOW"
         reasons.append("MODE_SAFE")
+
     elif mode == "normal":
         risk_multiplier = RISK_MULTIPLIER_NORMAL
         priority = "NORMAL"
         reasons.append("MODE_NORMAL")
+
     elif mode == "aggressive":
         if score >= SCORE_HIGH_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_HIGH
@@ -2236,6 +2450,7 @@ def compute_execution_engine(
             risk_multiplier = RISK_MULTIPLIER_NORMAL
             priority = "NORMAL"
             reasons.append("MODE_AGGRESSIVE_NORMAL_SCORE")
+
     else:
         if score < SCORE_LOW_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_LOW
@@ -2263,115 +2478,8 @@ def compute_execution_engine(
         "priority": priority,
         "risk_multiplier": round(risk_multiplier, 4),
         "approved": True,
-        "reasons": reasons,
+        "reasons": reasons
     }
-
-
-# -------------------------------------------------------------------
-# AI HELPERS
-# -------------------------------------------------------------------
-def build_ai_system_snapshot(
-    symbol: Optional[str],
-    account: Optional[str],
-    magic: Optional[str],
-    lookback_days: int,
-    limit_trades: int,
-) -> Dict[str, Any]:
-    overview = system_overview(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
-
-    return {
-        "symbol": symbol.upper() if symbol else None,
-        "account": account,
-        "magic": magic,
-        "lookback_days": lookback_days,
-        "limit_trades": limit_trades,
-        "heartbeat": overview.get("heartbeat", {}),
-        "controls": overview.get("controls", {}),
-        "kpis": overview.get("kpis", {}),
-        "gate": overview.get("gate", {}),
-        "risk_engine": overview.get("risk_engine", {}),
-        "server_time_utc": overview.get("server_time_utc"),
-    }
-
-
-def generate_ai_system_review(
-    snapshot: Dict[str, Any],
-    operator_focus: Optional[str] = None,
-) -> Dict[str, Any]:
-    client = get_openai_client()
-
-    system_prompt = (
-        "You are an operations copilot for an automated trading infrastructure. "
-        "You do not give discretionary trading advice. "
-        "You summarize system state, risk posture, operational issues, "
-        "and concrete operator actions based only on supplied telemetry. "
-        "Return strict JSON with these keys: "
-        "executive_summary, key_risks, recommended_actions, operator_note, confidence."
-    )
-
-    user_payload = {
-        "operator_focus": operator_focus or "",
-        "snapshot": snapshot,
-    }
-
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}],
-            },
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "system_review",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "executive_summary": {"type": "string"},
-                        "key_risks": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "recommended_actions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "operator_note": {"type": "string"},
-                        "confidence": {"type": "number"},
-                    },
-                    "required": [
-                        "executive_summary",
-                        "key_risks",
-                        "recommended_actions",
-                        "operator_note",
-                        "confidence",
-                    ],
-                    "additionalProperties": False,
-                },
-            }
-        },
-    )
-
-    output_text = getattr(response, "output_text", None)
-    if not output_text:
-        raise HTTPException(status_code=502, detail="OpenAI returned empty output")
-
-    try:
-        return json.loads(output_text)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to parse OpenAI JSON output: {exc}")
 
 
 # -------------------------------------------------------------------
@@ -2380,9 +2488,12 @@ def generate_ai_system_review(
 @app.get("/controls/effective")
 def controls_effective(
     symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard),
+    _: bool = Depends(app_token_guard)
 ):
-    return {"ok": True, "controls": get_runtime_controls(symbol)}
+    return {
+        "ok": True,
+        "controls": get_runtime_controls(symbol)
+    }
 
 
 @app.get("/status/gate_auto")
@@ -2398,7 +2509,7 @@ def gate_auto(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     return {
@@ -2411,7 +2522,7 @@ def gate_auto(
             "limit_trades": limit_trades,
         },
         "kpis": result["kpis"],
-        "gate": result["gate"],
+        "gate": result["gate"]
     }
 
 
@@ -2429,7 +2540,7 @@ def status_risk_engine(
             "account": account,
             "magic": magic,
         },
-        "risk_engine": result,
+        "risk_engine": result
     }
 
 
@@ -2447,9 +2558,9 @@ def status_execution_engine(
         "ok": True,
         "input": {
             "score": score,
-            "gate_level": gate_level.upper(),
+            "gate_level": gate_level.upper()
         },
-        "execution_engine": result,
+        "execution_engine": result
     }
 
 
@@ -2470,10 +2581,7 @@ def gate_combo(
     risk_allow = bool(risk_engine["allow_new_entries"])
 
     allow_new_entries = (not paused) and controls_allow and auto_allow and risk_allow
-    final_risk_multiplier = (
-        safe_float(controls["risk_multiplier"], 1.0)
-        * safe_float(auto_gate["risk_multiplier"], 1.0)
-    )
+    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
 
     gate_level = auto_gate["gate_level"]
     if paused or not risk_allow:
@@ -2498,7 +2606,7 @@ def gate_combo(
         "controls": controls,
         "auto_gate": auto_gate,
         "risk_engine": risk_engine,
-        "reasons": reasons,
+        "reasons": reasons
     }
 
 
@@ -2518,7 +2626,7 @@ def rolling_kpis(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     kpis = summarize_kpis(rows)
@@ -2532,7 +2640,7 @@ def rolling_kpis(
             "lookback_days": lookback_days,
             "limit_trades": limit_trades,
         },
-        "kpis": kpis,
+        "kpis": kpis
     }
 
 
@@ -2551,7 +2659,7 @@ def system_overview(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades,
+        limit_trades=limit_trades
     )
 
     kpis = summarize_kpis(rows)
@@ -2578,52 +2686,7 @@ def system_overview(
         "controls": get_runtime_controls(symbol),
         "kpis": kpis,
         "gate": gate,
-        "risk_engine": risk_engine,
-    }
-
-
-# -------------------------------------------------------------------
-# AI ENDPOINT
-# -------------------------------------------------------------------
-@app.post("/ai/system_review", response_model=AISystemReviewOut)
-def ai_system_review(
-    data: AISystemReviewIn,
-    current_user: dict = Depends(get_current_user),
-):
-    if not ai_is_enabled():
-        raise HTTPException(
-            status_code=503,
-            detail="OpenAI integration is disabled or not configured",
-        )
-
-    snapshot = build_ai_system_snapshot(
-        symbol=data.symbol,
-        account=data.account,
-        magic=data.magic,
-        lookback_days=data.lookback_days,
-        limit_trades=data.limit_trades,
-    )
-
-    review = generate_ai_system_review(
-        snapshot=snapshot,
-        operator_focus=data.operator_focus,
-    )
-
-    return {
-        "ok": True,
-        "model": OPENAI_MODEL,
-        "generated_utc": utc_iso(),
-        "input_filters": {
-            "symbol": data.symbol.upper() if data.symbol else None,
-            "account": data.account,
-            "magic": data.magic,
-            "lookback_days": data.lookback_days,
-            "limit_trades": data.limit_trades,
-            "operator_focus": data.operator_focus,
-            "requested_by_user_id": current_user.get("id"),
-        },
-        "review": review,
-        "source_snapshot": snapshot,
+        "risk_engine": risk_engine
     }
 
 
@@ -2666,7 +2729,7 @@ def debug_state(symbol: str = Query(...)):
         "ok": True,
         "symbol": symbol,
         "signals": signals,
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -2698,7 +2761,11 @@ def debug_recent_acks(
         rows = cur.fetchall()
         conn.close()
 
-    return {"ok": True, "count": len(rows), "items": rows}
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": rows
+    }
 
 
 @app.get("/debug/delivery_status")
@@ -2729,7 +2796,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
         "ok": True,
         "signal": signal_row,
         "delivery_count": len(deliveries),
-        "deliveries": deliveries,
+        "deliveries": deliveries
     }
 
 
@@ -2737,7 +2804,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
 def debug_pending_by_consumer(
     account: str = Query(...),
     magic: str = Query(...),
-    symbol: str = Query(...),
+    symbol: str = Query(...)
 ):
     with DB_LOCK:
         conn = get_conn()
@@ -2762,4 +2829,8 @@ def debug_pending_by_consumer(
         except Exception:
             r["payload"] = {}
 
-    return {"ok": True, "count": len(rows), "items": rows}
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": rows
+    }
