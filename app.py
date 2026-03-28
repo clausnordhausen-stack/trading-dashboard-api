@@ -5,12 +5,14 @@ from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List
 from jose import jwt, JWTError
+from openai import OpenAI
+from functools import lru_cache
 import os
 import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="11.0.0")
+app = FastAPI(title="Signal Agent API", version="11.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -85,8 +87,14 @@ RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 
 AUTHORIZED_CONSUMERS_STRICT = os.getenv("AUTHORIZED_CONSUMERS_STRICT", "false").lower() == "true"
 
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4").strip()
+OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "true").lower() == "true"
+
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
 
 # -------------------------------------------------------------------
 # HELPERS
@@ -171,9 +179,8 @@ def decode_token(token: str) -> dict:
 
 
 def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
-    if APP_TOKEN:
-        if x_app_token != APP_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid app token")
+    if APP_TOKEN and x_app_token != APP_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid app token")
     return True
 
 
@@ -192,7 +199,7 @@ def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
         "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
         "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
         "symbol": symbol.upper() if symbol else None,
-        "source": "default_env"
+        "source": "default_env",
     }
 
 
@@ -232,6 +239,17 @@ def get_signal_row_by_id(signal_id: int) -> Optional[Dict[str, Any]]:
 def dt_or_none(value: Optional[str]) -> Optional[str]:
     dt = parse_dt(value)
     return utc_iso(dt) if dt else None
+
+
+@lru_cache(maxsize=1)
+def get_openai_client() -> OpenAI:
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def ai_is_enabled() -> bool:
+    return OPENAI_ENABLED and bool(OPENAI_API_KEY)
 
 
 # -------------------------------------------------------------------
@@ -352,7 +370,6 @@ def require_master(current_user: dict = Depends(get_current_user)):
 
 
 def compute_customer_access(customer: Dict[str, Any]) -> Dict[str, Any]:
-    access_start = parse_dt(customer.get("access_start_at"))
     access_end = parse_dt(customer.get("access_end_at"))
     grace_until = parse_dt(customer.get("grace_until"))
 
@@ -474,35 +491,16 @@ def build_me_payload(user: Dict[str, Any]) -> Dict[str, Any]:
 def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = signal_row.get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
-
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     if gate_level == "RED":
-        return {
-            "approved": False,
-            "reason": "GATE_RED",
-            "score": score
-        }
-
+        return {"approved": False, "reason": "GATE_RED", "score": score}
     if score < 0.60:
-        return {
-            "approved": False,
-            "reason": "SCORE_LT_0_60",
-            "score": score
-        }
-
+        return {"approved": False, "reason": "SCORE_LT_0_60", "score": score}
     if gate_level == "YELLOW" and score < 0.75:
-        return {
-            "approved": False,
-            "reason": "YELLOW_SCORE_LT_0_75",
-            "score": score
-        }
+        return {"approved": False, "reason": "YELLOW_SCORE_LT_0_75", "score": score}
 
-    return {
-        "approved": True,
-        "reason": "APPROVED",
-        "score": score
-    }
+    return {"approved": True, "reason": "APPROVED", "score": score}
 
 
 def expire_old_signals_and_deliveries():
@@ -561,9 +559,6 @@ def init_db():
         conn = get_conn()
         cur = conn.cursor()
 
-        # ----------------------------
-        # auth / customer area
-        # ----------------------------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -644,9 +639,6 @@ def init_db():
         )
         """)
 
-        # ----------------------------
-        # existing signal engine
-        # ----------------------------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -783,7 +775,6 @@ def seed_auth_data():
         conn = get_conn()
         cur = conn.cursor()
 
-        # master
         cur.execute(
             """
             SELECT id FROM users
@@ -803,7 +794,6 @@ def seed_auth_data():
                 (MASTER_EMAIL, MASTER_EMAIL, MASTER_PASSWORD, now, now),
             )
 
-        # demo customer
         cur.execute("SELECT id FROM customers WHERE code = ?", (DEMO_CUSTOMER_CODE,))
         customer = cur.fetchone()
 
@@ -886,6 +876,7 @@ def seed_auth_data():
 
 
 init_db()
+
 
 # -------------------------------------------------------------------
 # MODELS
@@ -971,6 +962,24 @@ class ConsumerUpsertIn(BaseModel):
     notes: Optional[str] = None
 
 
+class AISystemReviewIn(BaseModel):
+    symbol: Optional[str] = None
+    account: Optional[str] = None
+    magic: Optional[str] = None
+    lookback_days: int = 7
+    limit_trades: int = 50
+    operator_focus: Optional[str] = None
+
+
+class AISystemReviewOut(BaseModel):
+    ok: bool
+    model: str
+    generated_utc: str
+    input_filters: Dict[str, Any]
+    review: Dict[str, Any]
+    source_snapshot: Dict[str, Any]
+
+
 # -------------------------------------------------------------------
 # AUTH ROUTES
 # -------------------------------------------------------------------
@@ -1001,7 +1010,7 @@ def login(data: LoginRequest):
     )
     return {
         "access_token": access_token,
-        "token_type": "bearer"
+        "token_type": "bearer",
     }
 
 
@@ -1015,13 +1024,7 @@ def master_customers(current_user: dict = Depends(require_master)):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM customers
-            ORDER BY id ASC
-            """
-        )
+        cur.execute("SELECT * FROM customers ORDER BY id ASC")
         rows = cur.fetchall()
         conn.close()
 
@@ -1058,11 +1061,7 @@ def master_customers(current_user: dict = Depends(require_master)):
             "strategies": get_customer_strategies(customer_id),
         })
 
-    return {
-        "ok": True,
-        "count": len(items),
-        "items": items,
-    }
+    return {"ok": True, "count": len(items), "items": items}
 
 
 # -------------------------------------------------------------------
@@ -1073,8 +1072,9 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "11.0.0",
-        "server_time_utc": utc_iso()
+        "version": "11.1.0",
+        "server_time_utc": utc_iso(),
+        "openai_enabled": ai_is_enabled(),
     }
 
 
@@ -1084,7 +1084,8 @@ def health():
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "time": utc_iso()
+        "time": utc_iso(),
+        "openai_enabled": ai_is_enabled(),
     }
 
 
@@ -1151,7 +1152,7 @@ def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
                 "symbol": hb_symbol,
                 "enabled": 1,
                 "owner_name": r.get("owner_name"),
-                "notes": "heartbeat_fallback"
+                "notes": "heartbeat_fallback",
             })
 
     unique_map = {}
@@ -1182,17 +1183,13 @@ def resolve_target_consumers(symbol: str) -> List[Dict[str, Any]]:
 @app.get("/consumers")
 def consumers(symbol: Optional[str] = Query(default=None)):
     items = list_authorized_consumers(symbol=symbol)
-    return {
-        "ok": True,
-        "count": len(items),
-        "items": items
-    }
+    return {"ok": True, "count": len(items), "items": items}
 
 
 @app.post("/consumers/upsert")
 def consumers_upsert(
     data: ConsumerUpsertIn,
-    _: bool = Depends(app_token_guard)
+    _: bool = Depends(app_token_guard),
 ):
     symbol = data.symbol.strip().upper()
     account = data.account.strip()
@@ -1221,7 +1218,7 @@ def consumers_upsert(
             data.owner_name,
             data.notes,
             now,
-            now
+            now,
         ))
         conn.commit()
         conn.close()
@@ -1231,7 +1228,7 @@ def consumers_upsert(
         "account": account,
         "magic": magic,
         "symbol": symbol,
-        "enabled": data.enabled
+        "enabled": data.enabled,
     }
 
 
@@ -1249,7 +1246,6 @@ def heartbeat(data: HeartbeatPing):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-
         cur.execute("""
         INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1262,9 +1258,8 @@ def heartbeat(data: HeartbeatPing):
             now,
             data.status,
             data.comment,
-            data.owner_name
+            data.owner_name,
         ))
-
         conn.commit()
         conn.close()
 
@@ -1329,7 +1324,7 @@ def heartbeat_status(symbol: Optional[str] = Query(default=None)):
         "ok": True,
         "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
         "connected_count": connected_count,
-        "items": result
+        "items": result,
     }
 
 
@@ -1340,7 +1335,6 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
     symbol = symbol.upper()
     targets = resolve_target_consumers(symbol)
     now = utc_iso()
-
     created = []
 
     with DB_LOCK:
@@ -1366,14 +1360,14 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
                 magic,
                 symbol,
                 now,
-                now
+                now,
             ))
 
             created.append({
                 "signal_id": signal_id,
                 "account": account,
                 "magic": magic,
-                "symbol": symbol
+                "symbol": symbol,
             })
 
         cur.execute("""
@@ -1391,7 +1385,7 @@ def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]
 @app.post("/tv")
 def tv_signal(
     data: TVSignalIn,
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
 ):
     expire_old_signals_and_deliveries()
 
@@ -1414,12 +1408,10 @@ def tv_signal(
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-
         cur.execute("""
         INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
         VALUES (?, ?, ?, ?, ?, 'pending')
         """, (symbol, side, payload_json, now, now))
-
         signal_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -1433,7 +1425,7 @@ def tv_signal(
         "side": side,
         "created_utc": now,
         "deliveries_created": len(deliveries),
-        "deliveries": deliveries
+        "deliveries": deliveries,
     }
 
 
@@ -1483,7 +1475,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": True,
             "controls": controls,
-            "gate": gate_payload
+            "gate": gate_payload,
         }
 
     delivery = get_latest_delivery_for_consumer(symbol=symbol, account=account, magic=magic)
@@ -1495,7 +1487,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": False,
             "controls": controls,
-            "gate": gate_payload
+            "gate": gate_payload,
         }
 
     signal_created = parse_dt(delivery.get("signal_created_utc"))
@@ -1524,7 +1516,7 @@ def latest_signal(
                 "signal_age_sec": age_sec,
                 "symbol": symbol,
                 "controls": controls,
-                "gate": gate_payload
+                "gate": gate_payload,
             }
 
     signal_row = {
@@ -1553,7 +1545,7 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            }
+            },
         }
 
     execution_engine = compute_execution_engine(signal_row, gate_payload)
@@ -1572,7 +1564,7 @@ def latest_signal(
                 "delivery_id": delivery["id"],
                 "signal_id": delivery["signal_id"],
                 "delivery_status": delivery["delivery_status"],
-            }
+            },
         }
 
     with DB_LOCK:
@@ -1614,7 +1606,7 @@ def latest_signal(
             "first_seen_utc": delivery.get("first_seen_utc"),
             "ack_utc": delivery.get("ack_utc"),
         },
-        "signal": signal_row
+        "signal": signal_row,
     }
 
 
@@ -1689,7 +1681,7 @@ def ack_signal(data: AckIn):
         "delivery_id": delivery_id,
         "symbol": symbol,
         "account": account,
-        "magic": magic
+        "magic": magic,
     }
 
 
@@ -1736,7 +1728,7 @@ def post_deal(data: DealIn):
         account=data.account,
         magic=data.magic,
         symbol=symbol,
-        explicit_signal_id=data.signal_id
+        explicit_signal_id=data.signal_id,
     )
 
     with DB_LOCK:
@@ -1772,7 +1764,7 @@ def post_deal(data: DealIn):
             data.strategy,
             deal_time,
             utc_iso(),
-            resolved_signal_id
+            resolved_signal_id,
         ))
 
         if resolved_signal_id and data.account and data.magic:
@@ -1794,7 +1786,7 @@ def post_deal(data: DealIn):
                 resolved_signal_id,
                 data.account,
                 data.magic,
-                symbol
+                symbol,
             ))
 
             cur.execute("""
@@ -1822,7 +1814,6 @@ def post_risk(data: RiskIn):
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-
         cur.execute("""
         INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1834,9 +1825,8 @@ def post_risk(data: RiskIn):
             data.level,
             data.message,
             data.value,
-            utc_iso()
+            utc_iso(),
         ))
-
         conn.commit()
         conn.close()
 
@@ -1865,11 +1855,9 @@ def get_deals_filtered(
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
-
     if account:
         query += " AND account = ?"
         params.append(account)
-
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1884,8 +1872,7 @@ def get_deals_filtered(
         rows = cur.fetchall()
         conn.close()
 
-    rows = list(reversed(rows))
-    return rows
+    return list(reversed(rows))
 
 
 def get_deals_today(
@@ -1905,11 +1892,9 @@ def get_deals_today(
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol.upper())
-
     if account:
         query += " AND account = ?"
         params.append(account)
-
     if magic:
         query += " AND magic = ?"
         params.append(magic)
@@ -1930,8 +1915,7 @@ def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
     curve = [0.0]
     running = 0.0
     for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        running += pnl
+        running += safe_float(r.get("pnl"), 0.0)
         curve.append(running)
     return curve
 
@@ -1990,7 +1974,6 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = 0
     losses = 0
     breakeven = 0
-
     gross_profit = 0.0
     gross_loss = 0.0
     net_pnl = 0.0
@@ -2022,7 +2005,6 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_dd_pct = calc_max_drawdown_pct(curve)
     max_loss_streak = calc_loss_streak(rows)
     current_loss_streak = calc_current_loss_streak(rows)
-
     last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
@@ -2052,7 +2034,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": DEFAULT_GATE_LEVEL,
             "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
             "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"]
+            "reasons": ["AUTO_GATE_DISABLED"],
         }
 
     reasons_red = []
@@ -2066,13 +2048,10 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
 
     if dd_pct >= RED_DD_PCT:
         reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
-
     if cur_loss_streak >= RED_LOSS_STREAK:
         reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
-
     if sum_r <= RED_R_SUM:
         reasons_red.append(f"SUM_R<={RED_R_SUM}")
-
     if total_trades >= 5 and winrate < RED_WINRATE_MIN:
         reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
 
@@ -2081,18 +2060,15 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "RED",
             "allow_new_entries": False,
             "risk_multiplier": 0.0,
-            "reasons": reasons_red
+            "reasons": reasons_red,
         }
 
     if dd_pct >= YELLOW_DD_PCT:
         reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
-
     if cur_loss_streak >= YELLOW_LOSS_STREAK:
         reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
-
     if sum_r <= YELLOW_R_SUM:
         reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
-
     if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
         reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
 
@@ -2101,14 +2077,14 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "YELLOW",
             "allow_new_entries": True,
             "risk_multiplier": 0.5,
-            "reasons": reasons_yellow
+            "reasons": reasons_yellow,
         }
 
     return {
         "gate_level": "GREEN",
         "allow_new_entries": True,
         "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"]
+        "reasons": ["NORMAL"],
     }
 
 
@@ -2124,16 +2100,13 @@ def compute_auto_gate(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     kpis = summarize_kpis(rows)
     gate = auto_gate_from_kpis(kpis)
 
-    return {
-        "kpis": kpis,
-        "gate": gate
-    }
+    return {"kpis": kpis, "gate": gate}
 
 
 # -------------------------------------------------------------------
@@ -2171,7 +2144,7 @@ def compute_risk_engine(
                 "daily_r_cap": DAILY_R_CAP,
                 "daily_max_trades": DAILY_MAX_TRADES,
             },
-            "reasons": ["RISK_ENGINE_DISABLED"]
+            "reasons": ["RISK_ENGINE_DISABLED"],
         }
 
     if daily_pnl <= -abs(DAILY_LOSS_CAP_USD):
@@ -2204,7 +2177,7 @@ def compute_risk_engine(
             "daily_r_cap": DAILY_R_CAP,
             "daily_max_trades": DAILY_MAX_TRADES,
         },
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
@@ -2217,7 +2190,6 @@ def compute_execution_engine(
 ) -> Dict[str, Any]:
     payload = (signal_row or {}).get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
-
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     mode = EXECUTION_MODE
@@ -2233,7 +2205,7 @@ def compute_execution_engine(
             "priority": "BLOCKED",
             "risk_multiplier": 0.0,
             "approved": False,
-            "reasons": ["GATE_RED"]
+            "reasons": ["GATE_RED"],
         }
 
     if not SCORE_TO_RISK_ENABLED:
@@ -2244,19 +2216,17 @@ def compute_execution_engine(
             "priority": "NORMAL",
             "risk_multiplier": RISK_MULTIPLIER_NORMAL,
             "approved": True,
-            "reasons": ["SCORE_TO_RISK_DISABLED"]
+            "reasons": ["SCORE_TO_RISK_DISABLED"],
         }
 
     if mode == "safe":
         risk_multiplier = min(RISK_MULTIPLIER_LOW, RISK_MULTIPLIER_NORMAL)
         priority = "LOW"
         reasons.append("MODE_SAFE")
-
     elif mode == "normal":
         risk_multiplier = RISK_MULTIPLIER_NORMAL
         priority = "NORMAL"
         reasons.append("MODE_NORMAL")
-
     elif mode == "aggressive":
         if score >= SCORE_HIGH_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_HIGH
@@ -2266,7 +2236,6 @@ def compute_execution_engine(
             risk_multiplier = RISK_MULTIPLIER_NORMAL
             priority = "NORMAL"
             reasons.append("MODE_AGGRESSIVE_NORMAL_SCORE")
-
     else:
         if score < SCORE_LOW_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_LOW
@@ -2294,8 +2263,115 @@ def compute_execution_engine(
         "priority": priority,
         "risk_multiplier": round(risk_multiplier, 4),
         "approved": True,
-        "reasons": reasons
+        "reasons": reasons,
     }
+
+
+# -------------------------------------------------------------------
+# AI HELPERS
+# -------------------------------------------------------------------
+def build_ai_system_snapshot(
+    symbol: Optional[str],
+    account: Optional[str],
+    magic: Optional[str],
+    lookback_days: int,
+    limit_trades: int,
+) -> Dict[str, Any]:
+    overview = system_overview(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades,
+    )
+
+    return {
+        "symbol": symbol.upper() if symbol else None,
+        "account": account,
+        "magic": magic,
+        "lookback_days": lookback_days,
+        "limit_trades": limit_trades,
+        "heartbeat": overview.get("heartbeat", {}),
+        "controls": overview.get("controls", {}),
+        "kpis": overview.get("kpis", {}),
+        "gate": overview.get("gate", {}),
+        "risk_engine": overview.get("risk_engine", {}),
+        "server_time_utc": overview.get("server_time_utc"),
+    }
+
+
+def generate_ai_system_review(
+    snapshot: Dict[str, Any],
+    operator_focus: Optional[str] = None,
+) -> Dict[str, Any]:
+    client = get_openai_client()
+
+    system_prompt = (
+        "You are an operations copilot for an automated trading infrastructure. "
+        "You do not give discretionary trading advice. "
+        "You summarize system state, risk posture, operational issues, "
+        "and concrete operator actions based only on supplied telemetry. "
+        "Return strict JSON with these keys: "
+        "executive_summary, key_risks, recommended_actions, operator_note, confidence."
+    )
+
+    user_payload = {
+        "operator_focus": operator_focus or "",
+        "snapshot": snapshot,
+    }
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}],
+            },
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "system_review",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "executive_summary": {"type": "string"},
+                        "key_risks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "recommended_actions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "operator_note": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": [
+                        "executive_summary",
+                        "key_risks",
+                        "recommended_actions",
+                        "operator_note",
+                        "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    )
+
+    output_text = getattr(response, "output_text", None)
+    if not output_text:
+        raise HTTPException(status_code=502, detail="OpenAI returned empty output")
+
+    try:
+        return json.loads(output_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to parse OpenAI JSON output: {exc}")
 
 
 # -------------------------------------------------------------------
@@ -2304,12 +2380,9 @@ def compute_execution_engine(
 @app.get("/controls/effective")
 def controls_effective(
     symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard)
+    _: bool = Depends(app_token_guard),
 ):
-    return {
-        "ok": True,
-        "controls": get_runtime_controls(symbol)
-    }
+    return {"ok": True, "controls": get_runtime_controls(symbol)}
 
 
 @app.get("/status/gate_auto")
@@ -2325,7 +2398,7 @@ def gate_auto(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     return {
@@ -2338,7 +2411,7 @@ def gate_auto(
             "limit_trades": limit_trades,
         },
         "kpis": result["kpis"],
-        "gate": result["gate"]
+        "gate": result["gate"],
     }
 
 
@@ -2356,7 +2429,7 @@ def status_risk_engine(
             "account": account,
             "magic": magic,
         },
-        "risk_engine": result
+        "risk_engine": result,
     }
 
 
@@ -2365,14 +2438,8 @@ def status_execution_engine(
     score: float = Query(default=1.0),
     gate_level: str = Query(default="GREEN"),
 ):
-    dummy_signal = {
-        "payload": {
-            "score": score
-        }
-    }
-    dummy_gate = {
-        "gate_level": gate_level.upper()
-    }
+    dummy_signal = {"payload": {"score": score}}
+    dummy_gate = {"gate_level": gate_level.upper()}
 
     result = compute_execution_engine(dummy_signal, dummy_gate)
 
@@ -2380,9 +2447,9 @@ def status_execution_engine(
         "ok": True,
         "input": {
             "score": score,
-            "gate_level": gate_level.upper()
+            "gate_level": gate_level.upper(),
         },
-        "execution_engine": result
+        "execution_engine": result,
     }
 
 
@@ -2403,12 +2470,13 @@ def gate_combo(
     risk_allow = bool(risk_engine["allow_new_entries"])
 
     allow_new_entries = (not paused) and controls_allow and auto_allow and risk_allow
-    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
+    final_risk_multiplier = (
+        safe_float(controls["risk_multiplier"], 1.0)
+        * safe_float(auto_gate["risk_multiplier"], 1.0)
+    )
 
     gate_level = auto_gate["gate_level"]
-    if paused:
-        gate_level = "RED"
-    if not risk_allow:
+    if paused or not risk_allow:
         gate_level = "RED"
 
     reasons = []
@@ -2430,7 +2498,7 @@ def gate_combo(
         "controls": controls,
         "auto_gate": auto_gate,
         "risk_engine": risk_engine,
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
@@ -2450,7 +2518,7 @@ def rolling_kpis(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     kpis = summarize_kpis(rows)
@@ -2464,7 +2532,7 @@ def rolling_kpis(
             "lookback_days": lookback_days,
             "limit_trades": limit_trades,
         },
-        "kpis": kpis
+        "kpis": kpis,
     }
 
 
@@ -2483,7 +2551,7 @@ def system_overview(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     kpis = summarize_kpis(rows)
@@ -2492,10 +2560,7 @@ def system_overview(
 
     heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
-        if symbol:
-            heartbeat_payload = heartbeat_status(symbol=symbol)
-        else:
-            heartbeat_payload = heartbeat_status()
+        heartbeat_payload = heartbeat_status(symbol=symbol) if symbol else heartbeat_status()
     except Exception:
         pass
 
@@ -2513,7 +2578,52 @@ def system_overview(
         "controls": get_runtime_controls(symbol),
         "kpis": kpis,
         "gate": gate,
-        "risk_engine": risk_engine
+        "risk_engine": risk_engine,
+    }
+
+
+# -------------------------------------------------------------------
+# AI ENDPOINT
+# -------------------------------------------------------------------
+@app.post("/ai/system_review", response_model=AISystemReviewOut)
+def ai_system_review(
+    data: AISystemReviewIn,
+    current_user: dict = Depends(get_current_user),
+):
+    if not ai_is_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI integration is disabled or not configured",
+        )
+
+    snapshot = build_ai_system_snapshot(
+        symbol=data.symbol,
+        account=data.account,
+        magic=data.magic,
+        lookback_days=data.lookback_days,
+        limit_trades=data.limit_trades,
+    )
+
+    review = generate_ai_system_review(
+        snapshot=snapshot,
+        operator_focus=data.operator_focus,
+    )
+
+    return {
+        "ok": True,
+        "model": OPENAI_MODEL,
+        "generated_utc": utc_iso(),
+        "input_filters": {
+            "symbol": data.symbol.upper() if data.symbol else None,
+            "account": data.account,
+            "magic": data.magic,
+            "lookback_days": data.lookback_days,
+            "limit_trades": data.limit_trades,
+            "operator_focus": data.operator_focus,
+            "requested_by_user_id": current_user.get("id"),
+        },
+        "review": review,
+        "source_snapshot": snapshot,
     }
 
 
@@ -2556,7 +2666,7 @@ def debug_state(symbol: str = Query(...)):
         "ok": True,
         "symbol": symbol,
         "signals": signals,
-        "deliveries": deliveries
+        "deliveries": deliveries,
     }
 
 
@@ -2570,11 +2680,7 @@ def debug_recent_acks(
         conn = get_conn()
         cur = conn.cursor()
 
-        query = """
-        SELECT *
-        FROM signal_acks
-        WHERE 1=1
-        """
+        query = "SELECT * FROM signal_acks WHERE 1=1"
         params = []
 
         if symbol:
@@ -2592,11 +2698,7 @@ def debug_recent_acks(
         rows = cur.fetchall()
         conn.close()
 
-    return {
-        "ok": True,
-        "count": len(rows),
-        "items": rows
-    }
+    return {"ok": True, "count": len(rows), "items": rows}
 
 
 @app.get("/debug/delivery_status")
@@ -2627,7 +2729,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
         "ok": True,
         "signal": signal_row,
         "delivery_count": len(deliveries),
-        "deliveries": deliveries
+        "deliveries": deliveries,
     }
 
 
@@ -2635,7 +2737,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
 def debug_pending_by_consumer(
     account: str = Query(...),
     magic: str = Query(...),
-    symbol: str = Query(...)
+    symbol: str = Query(...),
 ):
     with DB_LOCK:
         conn = get_conn()
@@ -2660,8 +2762,4 @@ def debug_pending_by_consumer(
         except Exception:
             r["payload"] = {}
 
-    return {
-        "ok": True,
-        "count": len(rows),
-        "items": rows
-    }
+    return {"ok": True, "count": len(rows), "items": rows}
