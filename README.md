@@ -1,65 +1,239 @@
-# Signal Agent API
+# Trading Systems Dashboard
 
-A production-style backend system for processing, filtering and distributing trading signals using Python and FastAPI.
+Mobile and desktop control interface for algorithmic trading systems.
 
-## 🚀 Overview
+Built with Flutter. Connected to the Signal Agent API.
 
-This project implements a full signal-processing pipeline including:
+---
 
-- Signal ingestion via API
-- Filtering based on score and risk logic
-- Dynamic execution engine
-- Risk management system
-- Customer & account handling
-- Delivery tracking & acknowledgment
-- KPI and performance analysis
+## Overview
 
-## 🧠 Core Features
+This dashboard is not a trading app.
 
-### Signal Engine
-- Receives and processes trading signals
-- Applies scoring and filtering logic
-- Distributes signals to connected clients
+It is a **control and monitoring interface** for automated trading systems.
 
-### Risk Engine
-- Daily loss limits
-- Trade count limits
-- R-multiple tracking
+The app allows users to:
 
-### Auto Gate System
-- KPI-based decision engine
-- Automatically blocks or reduces risk based on:
-  - drawdown
-  - win rate
-  - loss streak
+* monitor system status in real time
+* track trades and performance
+* control risk exposure
+* manage multiple trading accounts
+* receive alerts and system signals
 
-### Execution Engine
-- Dynamic risk adjustment based on signal score
-- Multiple modes: safe / normal / aggressive
+---
 
-### Authentication System
-- JWT-based login
-- Role-based access (master / customer)
+## Core Philosophy
 
-### Monitoring & Debugging
-- Heartbeat tracking (client connection monitoring)
-- Debug endpoints for signals and deliveries
-- KPI analytics endpoints
+The dashboard follows the same principle as the backend:
 
-## 🛠 Tech Stack
+Trading systems must be:
 
-- Python
-- FastAPI
-- SQLite
-- JWT Authentication
-- REST API design
+* controlled
+* transparent
+* structured
 
-## 📊 Why this project matters
+This app does not execute trades.
 
-This system demonstrates:
+It provides **visibility and control over automated execution systems**.
 
-- backend architecture design
-- API structuring and endpoint logic
-- state handling (signals, deliveries, trades)
-- risk-based decision systems
-- real-world use case implementation
+---
+
+## Architecture
+
+Flutter App (Frontend)
+↓
+REST API (Signal Agent API)
+↓
+Trading Systems (MT5 Expert Advisors)
+
+---
+
+## Key Features
+
+### Dashboard
+
+* Real-time system overview
+* Account selection
+* KPI visualization
+* System status indicators
+
+---
+
+### Activity Monitoring
+
+* Trade history
+* Signal tracking
+* Execution logs
+* Account-based filtering
+
+---
+
+### Risk Control
+
+* Gate level display (GREEN / YELLOW / RED)
+* Risk exposure overview
+* Drawdown tracking
+
+---
+
+### Alerts & Status
+
+* Heartbeat monitoring (EA online/offline)
+* System alerts
+* API connectivity status
+
+---
+
+### Multi-Account Support
+
+* Switch between accounts
+* Independent system tracking
+* Scalable architecture
+
+---
+
+## API Integration
+
+The app connects to:
+
+Signal Agent API
+
+Example:
+
+https://signal-agent-api.onrender.com
+
+---
+
+## Authentication
+
+* JWT-based login
+* Secure token storage via flutter_secure_storage
+* Auto-login support
+
+---
+
+## Project Structure
+
+lib/
+
+* app/ → app state & session
+* service/ → API communication
+* features/ → UI modules
+
+  * dashboard/
+  * activity/
+  * alerts/
+* domain/ → models (e.g. Trade)
+
+---
+
+## Setup
+
+### Requirements
+
+* Flutter SDK
+* Dart SDK
+* Windows / macOS / Web
+
+---
+
+### Install dependencies
+
+flutter pub get
+
+---
+
+### Run app
+
+flutter run
+
+---
+
+### Web build
+
+flutter build web
+
+---
+
+## Configuration
+
+API base URL is defined in:
+
+lib/service/api_service.dart
+
+Example:
+
+const baseUrl = "https://signal-agent-api.onrender.com";
+
+---
+
+## Environment
+
+Typical backend connection:
+
+* Hosted on Render
+* FastAPI backend
+* SQLite / PostgreSQL
+* JWT authentication
+
+---
+
+## Use Case
+
+Designed for:
+
+* EA traders (MT5)
+* multi-account setups
+* mobile system monitoring
+* risk-controlled trading environments
+
+---
+
+## Positioning
+
+Built with a mindset:
+
+* clarity over complexity
+* control over automation hype
+* structured decision systems
+
+Target users:
+
+* professional traders
+* system developers
+* capital-controlled environments
+
+---
+
+## Important Notice
+
+This application:
+
+* does NOT execute trades
+* does NOT provide financial advice
+* does NOT guarantee profits
+
+It is a control interface only.
+
+---
+
+## Roadmap
+
+* push notifications
+* advanced KPI charts
+* account management UI
+* AI insights integration
+* mobile-first optimization
+
+---
+
+## Author
+
+Claus Nordhausen
+claus.digital
+
+---
+
+## License
+
+Private / Proprietary
