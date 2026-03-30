@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-pydantic
+pydantic[email]
 python-jose[cryptography]
 openai
