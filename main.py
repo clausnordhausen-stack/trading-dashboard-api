@@ -2,13 +2,13 @@ import os
 import uvicorn
 
 
-def run():
+def run() -> None:
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=port,
-        reload=True
+        reload=True,
     )
 
 
