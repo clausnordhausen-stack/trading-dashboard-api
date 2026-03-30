@@ -1,15 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import json
 import os
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="Signal Agent API", version="6.2.0")
+app = FastAPI(title="Signal Agent API", version="6.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,12 +20,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+TV_API_KEY = os.getenv("TV_API_KEY", "supersecret123")
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
 
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # =========================================================
 # IN-MEMORY DEMO DATA
@@ -102,7 +109,6 @@ FAKE_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
     ],
 }
 
-# customer setup per email/account/strategy
 FAKE_CUSTOMER_SETUP: Dict[str, Dict[int, Dict[str, Dict[str, Any]]]] = {
     "test@test.com": {
         1: {
@@ -140,6 +146,11 @@ FAKE_CUSTOMER_SETUP: Dict[str, Dict[int, Dict[str, Dict[str, Any]]]] = {
     },
 }
 
+# runtime memory for signals / heartbeats / acks
+SIGNALS: List[Dict[str, Any]] = []
+SIGNAL_ACKS: List[Dict[str, Any]] = []
+HEARTBEATS: List[Dict[str, Any]] = []
+
 
 # =========================================================
 # MODELS
@@ -160,18 +171,62 @@ class StrategySetupIn(BaseModel):
     risk_tier: str
 
 
+class TVSignalIn(BaseModel):
+    key: Optional[str] = None
+    symbol: str
+    side: Optional[str] = None
+    action: Optional[str] = None
+    score: Optional[float] = 1.0
+    payload: Optional[Dict[str, Any]] = None
+
+
+class AckIn(BaseModel):
+    symbol: str
+    updated_utc: str
+    account: str
+    magic: Optional[str] = None
+    ticket: Optional[str] = None
+
+
+class HeartbeatPing(BaseModel):
+    key: Optional[str] = None
+    symbol: str
+    account: str
+    magic: Optional[str] = None
+    ea_name: Optional[str] = None
+    version: Optional[str] = None
+    status: Optional[str] = "alive"
+    comment: Optional[str] = None
+    owner_name: Optional[str] = None
+
+
 # =========================================================
 # HELPERS
 # =========================================================
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
+
+
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        text = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def create_token(email: str, role: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+    expire = now_utc() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": email,
         "role": role,
@@ -203,26 +258,6 @@ def get_user_accounts(email: str) -> List[Dict[str, Any]]:
 
 def get_account_strategies(account_id: int) -> List[Dict[str, Any]]:
     return FAKE_ACCOUNT_STRATEGIES.get(account_id, [])
-
-
-def infer_gate_level(symbol: str) -> str:
-    symbol = symbol.upper()
-    if symbol in ("XAUUSD", "BTCUSD"):
-        return "GREEN"
-    return "YELLOW"
-
-
-def risk_multiplier_for_tier(risk_tier: str) -> float:
-    rt = risk_tier.strip().lower()
-    if rt == "conservative":
-        return 0.5
-    if rt == "balanced":
-        return 1.0
-    if rt == "dynamic":
-        return 1.25
-    if rt == "aggressive":
-        return 1.5
-    return 1.0
 
 
 def ensure_account_access(email: str, account_id: int) -> None:
@@ -292,6 +327,80 @@ def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
     return result
 
 
+def risk_multiplier_for_tier(risk_tier: str) -> float:
+    rt = risk_tier.strip().lower()
+    if rt == "conservative":
+        return 0.5
+    if rt == "balanced":
+        return 1.0
+    if rt == "dynamic":
+        return 1.25
+    if rt == "aggressive":
+        return 1.5
+    return 1.0
+
+
+def normalize_side(value: Optional[str]) -> str:
+    text = (value or "").strip().upper()
+    if text == "LONG":
+        return "BUY"
+    if text == "SHORT":
+        return "SELL"
+    return text
+
+
+def find_customer_strategy(
+    email: str,
+    account_number: str,
+    symbol: str,
+    magic: str,
+) -> Optional[Dict[str, Any]]:
+    symbol = symbol.upper()
+
+    for account in get_customer_accounts_with_setup(email):
+        if account["account_number"] != account_number:
+            continue
+        for strategy in account["symbols"]:
+            if (
+                strategy["symbol"].upper() == symbol
+                and str(strategy["magic"]).strip() == str(magic).strip()
+            ):
+                return strategy
+    return None
+
+
+def latest_signal_for(symbol: str) -> Optional[Dict[str, Any]]:
+    symbol = symbol.upper()
+    matching = [s for s in SIGNALS if s["symbol"] == symbol]
+    if not matching:
+        return None
+    matching.sort(key=lambda x: x["created_utc"], reverse=True)
+    return matching[0]
+
+
+def is_signal_acked(signal_id: int, account: str, magic: str) -> bool:
+    for ack in SIGNAL_ACKS:
+        if (
+            ack["signal_id"] == signal_id
+            and ack["account"] == account
+            and ack["magic"] == magic
+        ):
+            return True
+    return False
+
+
+def cleanup_heartbeats() -> List[Dict[str, Any]]:
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
+    active: List[Dict[str, Any]] = []
+
+    for hb in HEARTBEATS:
+        last_seen = parse_dt(hb.get("last_seen_utc"))
+        if last_seen and last_seen >= cutoff:
+            active.append(hb)
+
+    return active
+
+
 # =========================================================
 # BASIC
 # =========================================================
@@ -301,7 +410,7 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "version": "6.2.0",
+        "version": "6.3.0",
         "server_time_utc": now_utc_iso(),
     }
 
@@ -415,7 +524,315 @@ def update_strategy_setup(
 
 
 # =========================================================
-# FLUTTER MONITORING ENDPOINTS
+# TV WEBHOOK / SIGNAL FLOW
+# =========================================================
+
+@app.post("/tv")
+def tv_signal(
+    data: TVSignalIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    provided_key = x_api_key or data.key
+    if provided_key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    symbol = data.symbol.strip().upper()
+    side = normalize_side(data.side or data.action)
+
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail="side/action must be BUY or SELL")
+
+    payload = dict(data.payload or {})
+    payload["score"] = data.score if data.score is not None else 1.0
+
+    signal_id = len(SIGNALS) + 1
+    row = {
+        "id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "payload": payload,
+        "payload_json": json.dumps(payload, ensure_ascii=False),
+        "created_utc": now_utc_iso(),
+        "updated_utc": now_utc_iso(),
+        "status": "pending",
+    }
+    SIGNALS.append(row)
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "created_utc": row["created_utc"],
+    }
+
+
+@app.get("/latest")
+def latest_signal(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    email = current_user["email"]
+
+    strategy = find_customer_strategy(
+        email=email,
+        account_number=account,
+        symbol=symbol_upper,
+        magic=magic,
+    )
+
+    if strategy is None:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": True,
+            "reason": "STRATEGY_NOT_ASSIGNED",
+            "symbol": symbol_upper,
+            "controls": {
+                "paused": False,
+                "allow_new_entries": False,
+                "risk_multiplier": 0.0,
+            },
+            "gate": {
+                "gate_level": "RED",
+                "allow_new_entries": False,
+                "risk_multiplier": 0.0,
+            },
+            "filter": {
+                "approved": False,
+                "reason": "STRATEGY_NOT_ASSIGNED",
+                "score": None,
+            },
+            "signal": None,
+        }
+
+    enabled = bool(strategy["enabled"])
+    risk_tier = strategy.get("risk_tier", "balanced")
+
+    if not enabled:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": True,
+            "reason": "STRATEGY_DISABLED",
+            "symbol": symbol_upper,
+            "controls": {
+                "paused": False,
+                "allow_new_entries": False,
+                "risk_multiplier": 0.0,
+            },
+            "gate": {
+                "gate_level": "RED",
+                "allow_new_entries": False,
+                "risk_multiplier": 0.0,
+            },
+            "filter": {
+                "approved": False,
+                "reason": "STRATEGY_DISABLED",
+                "score": None,
+            },
+            "signal": None,
+        }
+
+    signal = latest_signal_for(symbol_upper)
+    if signal is None:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": False,
+            "reason": None,
+            "symbol": symbol_upper,
+            "controls": {
+                "paused": False,
+                "allow_new_entries": True,
+                "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+            },
+            "gate": {
+                "gate_level": "GREEN",
+                "allow_new_entries": True,
+                "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+            },
+            "filter": {
+                "approved": True,
+                "reason": "NO_SIGNAL",
+                "score": None,
+            },
+            "signal": None,
+        }
+
+    if is_signal_acked(signal["id"], account, magic):
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": False,
+            "reason": "ALREADY_ACKED",
+            "symbol": symbol_upper,
+            "controls": {
+                "paused": False,
+                "allow_new_entries": True,
+                "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+            },
+            "gate": {
+                "gate_level": "GREEN",
+                "allow_new_entries": True,
+                "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+            },
+            "filter": {
+                "approved": True,
+                "reason": "ALREADY_ACKED",
+                "score": signal["payload"].get("score"),
+            },
+            "signal": None,
+        }
+
+    return {
+        "ok": True,
+        "has_signal": True,
+        "blocked": False,
+        "reason": None,
+        "symbol": symbol_upper,
+        "controls": {
+            "paused": False,
+            "allow_new_entries": True,
+            "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+        },
+        "gate": {
+            "gate_level": "GREEN",
+            "allow_new_entries": True,
+            "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+        },
+        "filter": {
+            "approved": True,
+            "reason": "APPROVED",
+            "score": signal["payload"].get("score"),
+        },
+        "execution_engine": {
+            "mode": "customer_setup",
+            "score_to_risk_enabled": True,
+            "score": signal["payload"].get("score"),
+            "priority": "NORMAL",
+            "risk_multiplier": risk_multiplier_for_tier(risk_tier),
+            "approved": True,
+            "reasons": ["CUSTOMER_SETUP_ACTIVE"],
+        },
+        "effective_risk_multiplier": risk_multiplier_for_tier(risk_tier),
+        "delivery": {
+            "delivery_id": signal["id"],
+            "signal_id": signal["id"],
+            "delivery_status": "pending",
+            "first_seen_utc": signal["created_utc"],
+            "ack_utc": None,
+        },
+        "signal": signal,
+    }
+
+
+@app.post("/ack")
+def ack_signal(data: AckIn) -> Dict[str, Any]:
+    symbol_upper = data.symbol.strip().upper()
+    magic = (data.magic or "").strip()
+
+    signal = None
+    for item in SIGNALS:
+        if (
+            item["symbol"] == symbol_upper
+            and item["updated_utc"] == data.updated_utc
+        ):
+            signal = item
+            break
+
+    if signal is None:
+        raise HTTPException(status_code=404, detail="Signal not found")
+
+    if not is_signal_acked(signal["id"], data.account, magic):
+        SIGNAL_ACKS.append(
+            {
+                "signal_id": signal["id"],
+                "symbol": symbol_upper,
+                "account": data.account,
+                "magic": magic,
+                "ack_utc": now_utc_iso(),
+                "ticket": data.ticket,
+            }
+        )
+
+    return {
+        "ok": True,
+        "signal_id": signal["id"],
+        "symbol": symbol_upper,
+        "account": data.account,
+        "magic": magic,
+    }
+
+
+# =========================================================
+# HEARTBEAT
+# =========================================================
+
+@app.post("/hb")
+def heartbeat(data: HeartbeatPing) -> Dict[str, Any]:
+    if data.key and data.key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid key")
+
+    row = {
+        "account": data.account,
+        "magic": data.magic,
+        "symbol": data.symbol.upper(),
+        "ea_name": data.ea_name,
+        "version": data.version,
+        "last_seen_utc": now_utc_iso(),
+        "connected": True,
+        "status": data.status,
+        "comment": data.comment,
+        "owner_name": data.owner_name,
+    }
+
+    HEARTBEATS.append(row)
+
+    return {
+        "ok": True,
+        "server_time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/status/heartbeat")
+def heartbeat_status(
+    symbol: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    active = cleanup_heartbeats()
+    items = [hb for hb in active if hb["symbol"] == symbol_upper]
+
+    if not items:
+        items = [
+            {
+                "account": "connected",
+                "magic": "n/a",
+                "symbol": symbol_upper,
+                "ea_name": f"{symbol_upper} Core EA",
+                "version": "1.0.0",
+                "last_seen_utc": now_utc_iso(),
+                "connected": True,
+                "status": "alive",
+                "comment": "mock heartbeat",
+                "owner_name": current_user["email"],
+            }
+        ]
+
+    return {
+        "ok": True,
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "connected_count": len(items),
+        "items": items,
+    }
+
+
+# =========================================================
+# STATUS / DASHBOARD
 # =========================================================
 
 @app.get("/status/system_overview")
@@ -426,17 +843,18 @@ def system_overview(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
     symbol_upper = symbol.upper()
+    email = current_user["email"]
 
-    current_setup = None
-    for account_item in get_customer_accounts_with_setup(current_user["email"]):
-        if account_item["account_number"] == account:
-            for strategy in account_item["symbols"]:
-                if strategy["symbol"] == symbol_upper:
-                    current_setup = strategy
-                    break
+    strategy = find_customer_strategy(
+        email=email,
+        account_number=account,
+        symbol=symbol_upper,
+        magic=magic,
+    )
 
-    enabled = current_setup["enabled"] if current_setup else True
-    risk_tier = current_setup["risk_tier"] if current_setup else "balanced"
+    enabled = bool(strategy["enabled"]) if strategy else False
+    risk_tier = strategy.get("risk_tier", "balanced") if strategy else "balanced"
+    gate_level = "GREEN" if enabled else "RED"
 
     return {
         "ok": True,
@@ -446,22 +864,7 @@ def system_overview(
             "account": account,
             "magic": magic,
         },
-        "heartbeat": {
-            "ok": True,
-            "connected_count": 1,
-            "items": [
-                {
-                    "symbol": symbol_upper,
-                    "account": account,
-                    "magic": magic,
-                    "connected": True,
-                    "last_seen_utc": now_utc_iso(),
-                    "ea_name": f"{symbol_upper} Core EA",
-                    "version": "1.0.0",
-                    "status": "alive",
-                }
-            ],
-        },
+        "heartbeat": heartbeat_status(symbol=symbol_upper, current_user=current_user),
         "controls": {
             "paused": False,
             "allow_new_entries": enabled,
@@ -491,7 +894,7 @@ def system_overview(
         "gate": {
             "ok": True,
             "symbol": symbol_upper,
-            "gate_level": "GREEN" if enabled else "RED",
+            "gate_level": gate_level,
             "allow_new_entries": enabled,
             "risk_multiplier": risk_multiplier_for_tier(risk_tier),
             "paused": False,
@@ -501,7 +904,7 @@ def system_overview(
                 "risk_multiplier": risk_multiplier_for_tier(risk_tier),
             },
             "auto_gate": {
-                "gate_level": "GREEN" if enabled else "RED",
+                "gate_level": gate_level,
                 "allow_new_entries": enabled,
                 "risk_multiplier": risk_multiplier_for_tier(risk_tier),
                 "reasons": ["CUSTOMER_SETUP_ACTIVE" if enabled else "STRATEGY_DISABLED"],
@@ -509,7 +912,7 @@ def system_overview(
             "risk_engine": {
                 "enabled": True,
                 "allow_new_entries": enabled,
-                "risk_level": "GREEN" if enabled else "RED",
+                "risk_level": gate_level,
                 "daily_pnl": 0.0,
                 "daily_r": 0.0,
                 "daily_trades": 0,
@@ -525,7 +928,7 @@ def system_overview(
         "risk_engine": {
             "enabled": True,
             "allow_new_entries": enabled,
-            "risk_level": "GREEN" if enabled else "RED",
+            "risk_level": gate_level,
             "daily_pnl": 0.0,
             "daily_r": 0.0,
             "daily_trades": 0,
@@ -546,22 +949,19 @@ def status_risk_engine(
     magic: str = Query(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    symbol_upper = symbol.upper()
+    strategy = find_customer_strategy(
+        email=current_user["email"],
+        account_number=account,
+        symbol=symbol.upper(),
+        magic=magic,
+    )
 
-    current_setup = None
-    for account_item in get_customer_accounts_with_setup(current_user["email"]):
-        if account_item["account_number"] == account:
-            for strategy in account_item["symbols"]:
-                if strategy["symbol"] == symbol_upper:
-                    current_setup = strategy
-                    break
-
-    enabled = current_setup["enabled"] if current_setup else True
+    enabled = bool(strategy["enabled"]) if strategy else False
 
     return {
         "ok": True,
         "filters": {
-            "symbol": symbol_upper,
+            "symbol": symbol.upper(),
             "account": account,
             "magic": magic,
         },
@@ -589,22 +989,19 @@ def gate_combo(
     magic: str = Query(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    symbol_upper = symbol.upper()
+    strategy = find_customer_strategy(
+        email=current_user["email"],
+        account_number=account,
+        symbol=symbol.upper(),
+        magic=magic,
+    )
 
-    current_setup = None
-    for account_item in get_customer_accounts_with_setup(current_user["email"]):
-        if account_item["account_number"] == account:
-            for strategy in account_item["symbols"]:
-                if strategy["symbol"] == symbol_upper:
-                    current_setup = strategy
-                    break
-
-    enabled = current_setup["enabled"] if current_setup else True
-    risk_tier = current_setup["risk_tier"] if current_setup else "balanced"
+    enabled = bool(strategy["enabled"]) if strategy else False
+    risk_tier = strategy.get("risk_tier", "balanced") if strategy else "balanced"
 
     return {
         "ok": True,
-        "symbol": symbol_upper,
+        "symbol": symbol.upper(),
         "gate_level": "GREEN" if enabled else "RED",
         "allow_new_entries": enabled,
         "risk_multiplier": risk_multiplier_for_tier(risk_tier),
@@ -613,7 +1010,7 @@ def gate_combo(
             "paused": False,
             "allow_new_entries": enabled,
             "risk_multiplier": risk_multiplier_for_tier(risk_tier),
-            "symbol": symbol_upper,
+            "symbol": symbol.upper(),
             "source": "customer_setup",
         },
         "auto_gate": {
@@ -640,86 +1037,23 @@ def gate_combo(
     }
 
 
-@app.get("/status/heartbeat")
-def heartbeat_status(
-    symbol: str = Query(...),
-    current_user: Dict[str, Any] = Depends(get_current_user),
-) -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "timeout_sec": 90,
-        "connected_count": 1,
-        "items": [
-            {
-                "account": "connected",
-                "magic": "n/a",
-                "symbol": symbol.upper(),
-                "ea_name": f"{symbol.upper()} Core EA",
-                "version": "1.0.0",
-                "last_seen_utc": now_utc_iso(),
-                "connected": True,
-                "status": "alive",
-                "comment": "mock heartbeat",
-                "owner_name": current_user["email"],
-            }
-        ],
-    }
-
-
-@app.get("/latest")
-def latest_signal(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: str = Query(...),
-    current_user: Dict[str, Any] = Depends(get_current_user),
-) -> Dict[str, Any]:
-    symbol_upper = symbol.upper()
-
-    current_setup = None
-    for account_item in get_customer_accounts_with_setup(current_user["email"]):
-        if account_item["account_number"] == account:
-            for strategy in account_item["symbols"]:
-                if strategy["symbol"] == symbol_upper:
-                    current_setup = strategy
-                    break
-
-    enabled = current_setup["enabled"] if current_setup else True
-
-    return {
-        "ok": True,
-        "has_signal": False,
-        "blocked": not enabled,
-        "reason": None if enabled else "STRATEGY_DISABLED",
-        "symbol": symbol_upper,
-        "controls": {
-            "paused": False,
-            "allow_new_entries": enabled,
-            "risk_multiplier": 1.0,
-        },
-        "gate": {
-            "gate_level": "GREEN" if enabled else "RED",
-            "allow_new_entries": enabled,
-            "risk_multiplier": 1.0,
-        },
-        "filter": {
-            "approved": enabled,
-            "reason": "NO_SIGNAL" if enabled else "STRATEGY_DISABLED",
-            "score": None,
-        },
-        "signal": None,
-    }
-
+# =========================================================
+# DEBUG
+# =========================================================
 
 @app.get("/debug/state")
 def debug_state(
     symbol: str = Query(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    signals = [s for s in SIGNALS if s["symbol"] == symbol_upper]
+
     return {
         "ok": True,
-        "symbol": symbol.upper(),
-        "signals": [],
-        "deliveries": [],
+        "symbol": symbol_upper,
+        "signals": signals[-10:],
+        "deliveries": signals[-50:],
     }
 
 
@@ -730,11 +1064,22 @@ def debug_recent_acks(
     magic: Optional[str] = Query(default=None),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
+    rows = SIGNAL_ACKS
+
+    if symbol:
+        rows = [r for r in rows if r["symbol"] == symbol.upper()]
+    if account:
+        rows = [r for r in rows if r["account"] == account]
+    if magic:
+        rows = [r for r in rows if r["magic"] == magic]
+
+    rows = sorted(rows, key=lambda x: x["ack_utc"], reverse=True)
+
     return {
         "ok": True,
-        "count": 0,
-        "items": [],
-        "acks": [],
+        "count": len(rows),
+        "items": rows[:100],
+        "acks": rows[:100],
         "filters": {
             "symbol": symbol.upper() if symbol else None,
             "account": account,
@@ -748,12 +1093,11 @@ def debug_delivery_status(
     signal_id: int = Query(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
+    signal = next((s for s in SIGNALS if s["id"] == signal_id), None)
+
     return {
         "ok": True,
-        "signal": {
-            "id": signal_id,
-            "status": "not_implemented",
-        },
+        "signal": signal,
         "delivery_count": 0,
         "deliveries": [],
     }
@@ -766,13 +1110,31 @@ def debug_pending_by_consumer(
     symbol: str = Query(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    latest = latest_signal_for(symbol_upper)
+
+    items: List[Dict[str, Any]] = []
+    if latest and not is_signal_acked(latest["id"], account, magic):
+        items.append(
+            {
+                "signal_id": latest["id"],
+                "symbol": symbol_upper,
+                "account": account,
+                "magic": magic,
+                "delivery_status": "pending",
+                "payload": latest.get("payload", {}),
+                "signal_created_utc": latest.get("created_utc"),
+                "signal_updated_utc": latest.get("updated_utc"),
+            }
+        )
+
     return {
         "ok": True,
-        "count": 0,
-        "items": [],
+        "count": len(items),
+        "items": items,
         "filters": {
             "account": account,
             "magic": magic,
-            "symbol": symbol.upper(),
+            "symbol": symbol_upper,
         },
     }
