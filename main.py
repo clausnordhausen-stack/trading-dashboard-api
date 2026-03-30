@@ -1,16 +1,49 @@
-import os
-import uvicorn
+import 'package:flutter/material.dart';
 
+import 'app/app_session.dart';
+import 'app/theme.dart';
+import 'screens/app_shell.dart';
+import 'screens/login_screen.dart';
 
-def run() -> None:
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True,
-    )
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
 
+  try {
+    await AppSession.initialize();
+  } catch (e) {
+    debugPrint('AppSession initialize error: $e');
+  }
 
-if __name__ == "__main__":
-    run()
+  runApp(const TradingSystemsDashboardApp());
+}
+
+class TradingSystemsDashboardApp extends StatelessWidget {
+  const TradingSystemsDashboardApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Trading Systems Dashboard',
+      debugShowCheckedModeBanner: false,
+      theme: buildAppTheme(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: AppSession.isAuthenticated,
+      builder: (context, isAuthenticated, _) {
+        if (isAuthenticated) {
+          return const AppShell();
+        }
+        return const LoginScreen();
+      },
+    );
+  }
+}
