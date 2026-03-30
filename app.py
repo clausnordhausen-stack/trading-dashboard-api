@@ -1,18 +1,16 @@
 from fastapi import FastAPI, HTTPException, Query, Depends, status, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List
 from jose import jwt, JWTError
-from openai import OpenAI
-from functools import lru_cache
 import os
 import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="11.1.0")
+app = FastAPI(title="Signal Agent API", version="12.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,25 +25,14 @@ app.add_middleware(
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
-DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
-HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
-
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-APP_USERNAME = os.getenv("APP_USERNAME", "admin")
-APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
-MASTER_EMAIL = os.getenv("MASTER_EMAIL", APP_USERNAME)
-MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", APP_PASSWORD)
-
-DEMO_CUSTOMER_EMAIL = os.getenv("DEMO_CUSTOMER_EMAIL", "customer@claus.digital")
-DEMO_CUSTOMER_PASSWORD = os.getenv("DEMO_CUSTOMER_PASSWORD", "Customer123!")
-DEMO_CUSTOMER_CODE = os.getenv("DEMO_CUSTOMER_CODE", "CUS-1001")
-DEMO_CUSTOMER_NAME = os.getenv("DEMO_CUSTOMER_NAME", "Demo Customer")
+DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
 
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 APP_TOKEN_HEADER = os.getenv("APP_TOKEN_HEADER", "X-APP-TOKEN").strip() or "X-APP-TOKEN"
-
 TV_API_KEY = os.getenv("TV_API_KEY", SECRET_KEY)
 
 DEFAULT_ALLOW_NEW_ENTRIES = os.getenv("DEFAULT_ALLOW_NEW_ENTRIES", "true").lower() == "true"
@@ -56,16 +43,12 @@ DEFAULT_KPI_LOOKBACK_DAYS = int(os.getenv("DEFAULT_KPI_LOOKBACK_DAYS", "7"))
 DEFAULT_KPI_LIMIT_TRADES = int(os.getenv("DEFAULT_KPI_LIMIT_TRADES", "50"))
 
 AUTO_GATE_ENABLED = os.getenv("AUTO_GATE_ENABLED", "true").lower() == "true"
-
 YELLOW_DD_PCT = float(os.getenv("YELLOW_DD_PCT", "3.0"))
 RED_DD_PCT = float(os.getenv("RED_DD_PCT", "6.0"))
-
 YELLOW_LOSS_STREAK = int(os.getenv("YELLOW_LOSS_STREAK", "3"))
 RED_LOSS_STREAK = int(os.getenv("RED_LOSS_STREAK", "5"))
-
 YELLOW_R_SUM = float(os.getenv("YELLOW_R_SUM", "-2.0"))
 RED_R_SUM = float(os.getenv("RED_R_SUM", "-4.0"))
-
 YELLOW_WINRATE_MIN = float(os.getenv("YELLOW_WINRATE_MIN", "35.0"))
 RED_WINRATE_MIN = float(os.getenv("RED_WINRATE_MIN", "25.0"))
 
@@ -87,9 +70,13 @@ RISK_MULTIPLIER_HIGH = float(os.getenv("RISK_MULTIPLIER_HIGH", "1.5"))
 
 AUTHORIZED_CONSUMERS_STRICT = os.getenv("AUTHORIZED_CONSUMERS_STRICT", "false").lower() == "true"
 
-# OpenAI
-OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "false").lower() == "true"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4").strip()
+# Default seed users
+MASTER_EMAIL = os.getenv("MASTER_EMAIL", "master@claus.digital")
+MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "ChangeMe123!")
+
+FIRST_CUSTOMER_EMAIL = os.getenv("FIRST_CUSTOMER_EMAIL", "claus@claus.digital")
+FIRST_CUSTOMER_PASSWORD = os.getenv("FIRST_CUSTOMER_PASSWORD", "Claus123!")
+FIRST_CUSTOMER_NAME = os.getenv("FIRST_CUSTOMER_NAME", "Claus Nordhausen")
 
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -159,6 +146,12 @@ def safe_int(x, default=0):
         return default
 
 
+def safe_str(x, default=""):
+    if x is None:
+        return default
+    return str(x).strip()
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -183,22 +176,21 @@ def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_
 
 
 def normalize_side(value: Optional[str]) -> str:
-    s = (value or "").strip().upper()
+    s = safe_str(value).upper()
     if s == "LONG":
-        s = "BUY"
-    elif s == "SHORT":
-        s = "SELL"
+        return "BUY"
+    if s == "SHORT":
+        return "SELL"
     return s
 
 
-def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
-    return {
-        "paused": DEFAULT_PAUSED,
-        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
-        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
-        "symbol": symbol.upper() if symbol else None,
-        "source": "default_env"
-    }
+def load_signal_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {}
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    return payload
 
 
 def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
@@ -213,387 +205,6 @@ def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
     conn.close()
 
 
-def load_signal_payload(row: Dict[str, Any]) -> Dict[str, Any]:
-    payload = {}
-    try:
-        payload = json.loads(row.get("payload_json") or "{}")
-    except Exception:
-        payload = {}
-    return payload
-
-
-def get_signal_row_by_id(signal_id: int) -> Optional[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
-        row = cur.fetchone()
-        conn.close()
-    if row:
-        row["payload"] = load_signal_payload(row)
-    return row
-
-
-def dt_or_none(value: Optional[str]) -> Optional[str]:
-    dt = parse_dt(value)
-    return utc_iso(dt) if dt else None
-
-
-@lru_cache(maxsize=1)
-def get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    return OpenAI(api_key=api_key)
-
-
-def extract_response_text(resp: Any) -> str:
-    try:
-        output_text = getattr(resp, "output_text", None)
-        if output_text:
-            return output_text.strip()
-    except Exception:
-        pass
-
-    try:
-        output = getattr(resp, "output", None) or []
-        parts: List[str] = []
-        for item in output:
-            contents = getattr(item, "content", None) or []
-            for c in contents:
-                text_value = getattr(c, "text", None)
-                if text_value:
-                    parts.append(text_value)
-        return "\n".join(parts).strip()
-    except Exception:
-        return ""
-
-
-def safe_json_loads(text: str) -> Dict[str, Any]:
-    try:
-        return json.loads(text)
-    except Exception:
-        return {}
-
-
-# -------------------------------------------------------------------
-# AUTH / USER HELPERS
-# -------------------------------------------------------------------
-def get_user_by_login(identifier: str) -> Optional[Dict[str, Any]]:
-    identifier = identifier.strip()
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE lower(email) = lower(?) OR lower(username) = lower(?)
-            LIMIT 1
-            """,
-            (identifier, identifier),
-        )
-        row = cur.fetchone()
-        conn.close()
-    return row
-
-
-def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        row = cur.fetchone()
-        conn.close()
-    return row
-
-
-def get_customer_by_id(customer_id: int) -> Optional[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
-        row = cur.fetchone()
-        conn.close()
-    return row
-
-
-def get_customer_accounts(customer_id: int) -> List[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM customer_accounts
-            WHERE customer_id = ?
-            ORDER BY id ASC
-            """,
-            (customer_id,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-    return rows
-
-
-def get_customer_strategies(customer_id: int) -> List[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM customer_strategies
-            WHERE customer_id = ?
-            ORDER BY sort_order ASC, id ASC
-            """,
-            (customer_id,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-    return rows
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_token(token)
-    user_id_raw = payload.get("sub")
-    if not user_id_raw:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-
-    try:
-        user_id = int(user_id_raw)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-
-    user = get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-
-    if safe_int(user.get("is_active"), 0) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User inactive"
-        )
-
-    return user
-
-
-def require_master(current_user: dict = Depends(get_current_user)):
-    if (current_user.get("role") or "").lower() != "master":
-        raise HTTPException(status_code=403, detail="Master access required")
-    return current_user
-
-
-def compute_customer_access(customer: Dict[str, Any]) -> Dict[str, Any]:
-    access_end = parse_dt(customer.get("access_end_at"))
-    grace_until = parse_dt(customer.get("grace_until"))
-
-    access_status_db = (customer.get("access_status") or "active").lower()
-    trading_status_db = (customer.get("trading_status") or "enabled").lower()
-    subscription_status = (customer.get("subscription_status") or "active").lower()
-
-    now = now_utc()
-    effective_access_status = access_status_db
-    effective_trading_status = trading_status_db
-
-    if access_status_db == "paused" or subscription_status == "paused":
-        effective_access_status = "paused"
-        effective_trading_status = "disabled"
-    elif access_end and now > access_end:
-        if grace_until and now <= grace_until:
-            effective_access_status = "grace"
-        else:
-            effective_access_status = "expired"
-        effective_trading_status = "disabled"
-    elif subscription_status in ("expired", "canceled"):
-        effective_access_status = "expired"
-        effective_trading_status = "disabled"
-    elif trading_status_db != "enabled":
-        effective_trading_status = "disabled"
-    else:
-        effective_trading_status = "enabled"
-        if access_status_db not in ("active", "grace", "expired", "paused"):
-            effective_access_status = "active"
-
-    return {
-        "access_start_at": dt_or_none(customer.get("access_start_at")),
-        "access_end_at": dt_or_none(customer.get("access_end_at")),
-        "grace_until": dt_or_none(customer.get("grace_until")),
-        "access_status": effective_access_status,
-        "trading_status": effective_trading_status,
-        "subscription_status": subscription_status,
-        "risk_profile": customer.get("risk_profile") or "balanced",
-    }
-
-
-def build_me_payload(user: Dict[str, Any]) -> Dict[str, Any]:
-    role = (user.get("role") or "").lower()
-
-    base = {
-        "id": user.get("id"),
-        "username": user.get("username"),
-        "email": user.get("email"),
-        "role": role,
-        "is_active": bool(safe_int(user.get("is_active"), 0)),
-        "customer_id": user.get("customer_id"),
-    }
-
-    if role == "master":
-        return {
-            **base,
-            "display_name": "Master",
-            "customer_code": None,
-            "access_start_at": None,
-            "access_end_at": None,
-            "grace_until": None,
-            "access_status": "active",
-            "trading_status": "enabled",
-            "subscription_status": "active",
-            "risk_profile": "dynamic",
-            "accounts": [],
-            "strategies": [],
-        }
-
-    customer_id = user.get("customer_id")
-    if not customer_id:
-        return {
-            **base,
-            "display_name": user.get("email") or user.get("username") or "Customer",
-            "customer_code": None,
-            "access_start_at": None,
-            "access_end_at": None,
-            "grace_until": None,
-            "access_status": "expired",
-            "trading_status": "disabled",
-            "subscription_status": "expired",
-            "risk_profile": "balanced",
-            "accounts": [],
-            "strategies": [],
-        }
-
-    customer = get_customer_by_id(int(customer_id))
-    if not customer:
-        return {
-            **base,
-            "display_name": user.get("email") or user.get("username") or "Customer",
-            "customer_code": None,
-            "access_start_at": None,
-            "access_end_at": None,
-            "grace_until": None,
-            "access_status": "expired",
-            "trading_status": "disabled",
-            "subscription_status": "expired",
-            "risk_profile": "balanced",
-            "accounts": [],
-            "strategies": [],
-        }
-
-    access = compute_customer_access(customer)
-
-    return {
-        **base,
-        "display_name": customer.get("display_name") or user.get("email") or "Customer",
-        "customer_code": customer.get("code"),
-        **access,
-        "accounts": get_customer_accounts(int(customer_id)),
-        "strategies": get_customer_strategies(int(customer_id)),
-    }
-
-
-# -------------------------------------------------------------------
-# SIGNAL FILTER
-# -------------------------------------------------------------------
-def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
-    payload = signal_row.get("payload", {}) or {}
-    score = safe_float(payload.get("score"), 1.0)
-
-    gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
-
-    if gate_level == "RED":
-        return {
-            "approved": False,
-            "reason": "GATE_RED",
-            "score": score
-        }
-
-    if score < 0.60:
-        return {
-            "approved": False,
-            "reason": "SCORE_LT_0_60",
-            "score": score
-        }
-
-    if gate_level == "YELLOW" and score < 0.75:
-        return {
-            "approved": False,
-            "reason": "YELLOW_SCORE_LT_0_75",
-            "score": score
-        }
-
-    return {
-        "approved": True,
-        "reason": "APPROVED",
-        "score": score
-    }
-
-
-def expire_old_signals_and_deliveries():
-    cutoff_dt = now_utc() - timedelta(seconds=SIGNAL_TTL_SEC)
-    cutoff_iso = utc_iso(cutoff_dt)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        UPDATE signal_deliveries
-        SET delivery_status = 'expired',
-            expire_utc = COALESCE(expire_utc, ?),
-            updated_utc = ?
-        WHERE delivery_status IN ('pending', 'delivered')
-          AND created_utc < ?
-        """, (utc_iso(), utc_iso(), cutoff_iso))
-
-        cur.execute("""
-        UPDATE signals
-        SET status = CASE
-            WHEN NOT EXISTS (
-                SELECT 1
-                FROM signal_deliveries d
-                WHERE d.signal_id = signals.id
-                  AND d.delivery_status IN ('pending', 'delivered', 'acked')
-            ) THEN 'closed'
-            ELSE status
-        END
-        WHERE status IN ('pending', 'distributed')
-        """)
-
-        cur.execute("""
-        UPDATE signals
-        SET status = 'expired'
-        WHERE status IN ('pending', 'distributed')
-          AND created_utc < ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM signal_deliveries d
-              WHERE d.signal_id = signals.id
-                AND d.delivery_status IN ('pending', 'delivered', 'acked')
-          )
-        """, (cutoff_iso,))
-
-        conn.commit()
-        conn.close()
-
-
 # -------------------------------------------------------------------
 # DB INIT
 # -------------------------------------------------------------------
@@ -602,20 +213,17 @@ def init_db():
         conn = get_conn()
         cur = conn.cursor()
 
+        # ---------------- USER / CUSTOMER CORE ----------------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,
             display_name TEXT NOT NULL,
-            email TEXT,
             access_start_at TEXT,
             access_end_at TEXT,
             access_status TEXT NOT NULL DEFAULT 'active',
             trading_status TEXT NOT NULL DEFAULT 'enabled',
             subscription_status TEXT NOT NULL DEFAULT 'active',
             grace_until TEXT,
-            risk_profile TEXT NOT NULL DEFAULT 'balanced',
-            notes TEXT,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL
         )
@@ -624,15 +232,13 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            email TEXT UNIQUE,
+            email TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
             role TEXT NOT NULL,
-            is_active INTEGER NOT NULL DEFAULT 1,
             customer_id INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1,
             created_utc TEXT NOT NULL,
-            updated_utc TEXT NOT NULL,
-            FOREIGN KEY(customer_id) REFERENCES customers(id)
+            updated_utc TEXT NOT NULL
         )
         """)
 
@@ -640,13 +246,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS customer_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_id INTEGER NOT NULL,
+            broker_name TEXT,
             account_number TEXT NOT NULL,
             account_label TEXT NOT NULL,
-            broker_name TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
+            is_active INTEGER NOT NULL DEFAULT 1,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            FOREIGN KEY(customer_id) REFERENCES customers(id)
+            UNIQUE(customer_id, account_number)
         )
         """)
 
@@ -654,34 +260,39 @@ def init_db():
         CREATE TABLE IF NOT EXISTS customer_strategies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_id INTEGER NOT NULL,
-            account_number TEXT,
+            account_number TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            display_name TEXT NOT NULL,
+            strategy_code TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
             magic TEXT NOT NULL,
-            strategy_code TEXT,
-            risk_tier TEXT NOT NULL DEFAULT 'medium',
+            risk_tier TEXT NOT NULL DEFAULT 'balanced',
             enabled INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 999,
+            base_lot REAL NOT NULL DEFAULT 0.01,
+            max_lot REAL NOT NULL DEFAULT 1.0,
+            color TEXT NOT NULL DEFAULT '#D4AF37',
+            refresh_override_seconds INTEGER,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            FOREIGN KEY(customer_id) REFERENCES customers(id)
+            UNIQUE(customer_id, account_number, symbol, strategy_code, magic)
         )
         """)
 
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS access_audits (
+        CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER,
             actor_user_id INTEGER,
+            actor_role TEXT,
+            target_customer_id INTEGER,
+            target_account_number TEXT,
             action_type TEXT NOT NULL,
-            action_message TEXT NOT NULL,
+            message TEXT,
             payload_json TEXT,
-            created_utc TEXT NOT NULL,
-            FOREIGN KEY(customer_id) REFERENCES customers(id),
-            FOREIGN KEY(actor_user_id) REFERENCES users(id)
+            created_utc TEXT NOT NULL
         )
         """)
 
+        # ---------------- TRADING / EXISTING CORE ----------------
         cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -800,119 +411,92 @@ def init_db():
     ensure_column_exists("deals", "signal_id", "signal_id INTEGER")
     ensure_column_exists("signal_acks", "delivery_id", "delivery_id INTEGER")
     ensure_column_exists("heartbeats", "owner_name", "owner_name TEXT")
-    ensure_column_exists("users", "username", "username TEXT")
-    ensure_column_exists("users", "email", "email TEXT")
-    ensure_column_exists("users", "customer_id", "customer_id INTEGER")
-    ensure_column_exists("customers", "subscription_status", "subscription_status TEXT NOT NULL DEFAULT 'active'")
-    ensure_column_exists("customers", "grace_until", "grace_until TEXT")
-    ensure_column_exists("customers", "risk_profile", "risk_profile TEXT NOT NULL DEFAULT 'balanced'")
-    ensure_column_exists("customers", "notes", "notes TEXT")
 
-    seed_auth_data()
+    seed_initial_data()
 
 
-def seed_auth_data():
+def seed_initial_data():
     now = utc_iso()
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute(
-            """
-            SELECT id FROM users
-            WHERE lower(email) = lower(?) OR lower(username) = lower(?)
-            LIMIT 1
-            """,
-            (MASTER_EMAIL, MASTER_EMAIL),
-        )
-        existing_master = cur.fetchone()
+        # Master user
+        cur.execute("SELECT id FROM users WHERE lower(email) = lower(?)", (MASTER_EMAIL,))
+        master_user = cur.fetchone()
+        if not master_user:
+            cur.execute("""
+            INSERT INTO users(email, password, role, customer_id, is_active, created_utc, updated_utc)
+            VALUES (?, ?, 'master', NULL, 1, ?, ?)
+            """, (MASTER_EMAIL, MASTER_PASSWORD, now, now))
 
-        if not existing_master:
-            cur.execute(
-                """
-                INSERT INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
-                VALUES (?, ?, ?, 'master', 1, NULL, ?, ?)
-                """,
-                (MASTER_EMAIL, MASTER_EMAIL, MASTER_PASSWORD, now, now),
+        # First customer user
+        cur.execute("SELECT * FROM users WHERE lower(email) = lower(?)", (FIRST_CUSTOMER_EMAIL,))
+        customer_user = cur.fetchone()
+
+        if not customer_user:
+            cur.execute("""
+            INSERT INTO customers(
+                display_name, access_start_at, access_end_at,
+                access_status, trading_status, subscription_status, grace_until,
+                created_utc, updated_utc
             )
-
-        cur.execute("SELECT id FROM customers WHERE code = ?", (DEMO_CUSTOMER_CODE,))
-        customer = cur.fetchone()
-
-        if not customer:
-            access_start = utc_iso(now_utc() - timedelta(days=7))
-            access_end = utc_iso(now_utc() + timedelta(days=30))
-
-            cur.execute(
-                """
-                INSERT INTO customers(
-                    code, display_name, email, access_start_at, access_end_at,
-                    access_status, trading_status, subscription_status, grace_until,
-                    risk_profile, notes, created_utc, updated_utc
-                )
-                VALUES (?, ?, ?, ?, ?, 'active', 'enabled', 'active', NULL, 'balanced', ?, ?, ?)
-                """,
-                (
-                    DEMO_CUSTOMER_CODE,
-                    DEMO_CUSTOMER_NAME,
-                    DEMO_CUSTOMER_EMAIL,
-                    access_start,
-                    access_end,
-                    "Seeded demo customer",
-                    now,
-                    now,
-                ),
-            )
+            VALUES (?, ?, NULL, 'active', 'enabled', 'active', NULL, ?, ?)
+            """, (
+                FIRST_CUSTOMER_NAME,
+                now,
+                now,
+                now,
+            ))
             customer_id = cur.lastrowid
 
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
-                VALUES (?, ?, ?, 'customer', 1, ?, ?, ?)
-                """,
-                (DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_PASSWORD, customer_id, now, now),
-            )
+            cur.execute("""
+            INSERT INTO users(email, password, role, customer_id, is_active, created_utc, updated_utc)
+            VALUES (?, ?, 'customer', ?, 1, ?, ?)
+            """, (
+                FIRST_CUSTOMER_EMAIL,
+                FIRST_CUSTOMER_PASSWORD,
+                customer_id,
+                now,
+                now,
+            ))
 
-            cur.execute(
-                """
-                INSERT INTO customer_accounts(customer_id, account_number, account_label, broker_name, enabled, created_utc, updated_utc)
+            seed_accounts = [
+                ("TheTradingPit", "504055635", "Claus Nordhausen"),
+                ("TheTradingPit", "504047407", "TheTradingPit - Gina Marie Menge"),
+                ("TheTradingPit", "504046072", "TheTradingPit - Katja Nordhausen"),
+            ]
+
+            for broker_name, account_number, account_label in seed_accounts:
+                cur.execute("""
+                INSERT OR IGNORE INTO customer_accounts(
+                    customer_id, broker_name, account_number, account_label, is_active, created_utc, updated_utc
+                )
                 VALUES (?, ?, ?, ?, 1, ?, ?)
-                """,
-                (customer_id, "195333", "Main Account", "Demo Broker", now, now),
-            )
+                """, (customer_id, broker_name, account_number, account_label, now, now))
 
-            cur.execute(
-                """
-                INSERT INTO customer_strategies(customer_id, account_number, symbol, display_name, magic, strategy_code, risk_tier, enabled, sort_order, created_utc, updated_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                """,
-                (customer_id, "195333", "XAUUSD", "Gold", "777", "xau_core", "medium", 1, now, now),
-            )
-            cur.execute(
-                """
-                INSERT INTO customer_strategies(customer_id, account_number, symbol, display_name, magic, strategy_code, risk_tier, enabled, sort_order, created_utc, updated_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                """,
-                (customer_id, "195333", "BTCUSD", "Bitcoin", "62001", "btc_core", "high", 2, now, now),
-            )
+                cur.execute("""
+                INSERT OR IGNORE INTO customer_strategies(
+                    customer_id, account_number, symbol, strategy_code, strategy_name, magic,
+                    risk_tier, enabled, sort_order, base_lot, max_lot, color,
+                    refresh_override_seconds, created_utc, updated_utc
+                )
+                VALUES (?, ?, 'XAUUSD', 'xau_core', 'Gold', '777',
+                        'balanced', 1, 1, 0.01, 1.00, '#D4AF37',
+                        NULL, ?, ?)
+                """, (customer_id, account_number, now, now))
 
-            cur.execute(
-                """
-                INSERT INTO access_audits(customer_id, actor_user_id, action_type, action_message, payload_json, created_utc)
-                VALUES (?, NULL, 'seed', 'Demo customer created', NULL, ?)
-                """,
-                (customer_id, now),
-            )
-        else:
-            customer_id = customer["id"]
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO users(username, email, password, role, is_active, customer_id, created_utc, updated_utc)
-                VALUES (?, ?, ?, 'customer', 1, ?, ?, ?)
-                """,
-                (DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_EMAIL, DEMO_CUSTOMER_PASSWORD, customer_id, now, now),
-            )
+                cur.execute("""
+                INSERT OR IGNORE INTO customer_strategies(
+                    customer_id, account_number, symbol, strategy_code, strategy_name, magic,
+                    risk_tier, enabled, sort_order, base_lot, max_lot, color,
+                    refresh_override_seconds, created_utc, updated_utc
+                )
+                VALUES (?, ?, 'BTCUSD', 'btc_core', 'Bitcoin', '62001',
+                        'balanced', 1, 2, 0.01, 1.00, '#F7931A',
+                        NULL, ?, ?)
+                """, (customer_id, account_number, now, now))
 
         conn.commit()
         conn.close()
@@ -921,11 +505,157 @@ def seed_auth_data():
 init_db()
 
 # -------------------------------------------------------------------
+# USER HELPERS
+# -------------------------------------------------------------------
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE lower(email) = lower(?)", (email,))
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_customer_by_id(customer_id: int) -> Optional[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = decode_token(token)
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
+
+    user = get_user_by_id(int(user_id))
+    if not user or safe_int(user.get("is_active"), 0) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User inactive or missing"
+        )
+    return user
+
+
+def require_master(current_user: dict = Depends(get_current_user)):
+    if safe_str(current_user.get("role")) != "master":
+        raise HTTPException(status_code=403, detail="Master role required")
+    return current_user
+
+
+def require_customer(current_user: dict = Depends(get_current_user)):
+    if safe_str(current_user.get("role")) != "customer":
+        raise HTTPException(status_code=403, detail="Customer role required")
+    return current_user
+
+
+def write_audit_log(
+    actor_user_id: Optional[int],
+    actor_role: Optional[str],
+    action_type: str,
+    message: str,
+    target_customer_id: Optional[int] = None,
+    target_account_number: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+):
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO audit_logs(
+            actor_user_id, actor_role, target_customer_id, target_account_number,
+            action_type, message, payload_json, created_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            actor_user_id,
+            actor_role,
+            target_customer_id,
+            target_account_number,
+            action_type,
+            message,
+            json.dumps(payload or {}, ensure_ascii=False),
+            utc_iso(),
+        ))
+        conn.commit()
+        conn.close()
+
+
+def build_customer_accounts_payload(customer_id: int) -> List[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        SELECT *
+        FROM customer_accounts
+        WHERE customer_id = ? AND is_active = 1
+        ORDER BY account_label, account_number
+        """, (customer_id,))
+        accounts = cur.fetchall()
+
+        cur.execute("""
+        SELECT *
+        FROM customer_strategies
+        WHERE customer_id = ? AND enabled = 1
+        ORDER BY account_number, sort_order, symbol, strategy_name
+        """, (customer_id,))
+        strategies = cur.fetchall()
+
+        conn.close()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in strategies:
+        grouped.setdefault(row["account_number"], []).append({
+            "symbol": row["symbol"],
+            "displayName": row["strategy_name"],
+            "magic": row["magic"],
+            "enabled": bool(row["enabled"]),
+            "sortOrder": row["sort_order"],
+            "baseLot": row["base_lot"],
+            "maxLot": row["max_lot"],
+            "color": row["color"],
+            "refreshOverrideSeconds": row["refresh_override_seconds"],
+            "strategyCode": row["strategy_code"],
+            "riskTier": row["risk_tier"],
+        })
+
+    result = []
+    for account in accounts:
+        result.append({
+            "accountNumber": account["account_number"],
+            "label": account["account_label"],
+            "enabled": bool(account["is_active"]),
+            "brokerName": account.get("broker_name"),
+            "symbols": grouped.get(account["account_number"], []),
+        })
+
+    return result
+
+
+# -------------------------------------------------------------------
 # MODELS
 # -------------------------------------------------------------------
 class LoginRequest(BaseModel):
-    username: Optional[str] = None
-    email: Optional[str] = None
+    email: EmailStr
     password: str
 
 
@@ -1004,30 +734,58 @@ class ConsumerUpsertIn(BaseModel):
     notes: Optional[str] = None
 
 
-class AIDecisionIn(BaseModel):
-    symbol: str
-    side: str
-    score: Optional[float] = 1.0
-    account: Optional[str] = None
-    magic: Optional[str] = None
-    context: Optional[Dict[str, Any]] = None
+class MasterCustomerCreateIn(BaseModel):
+    display_name: str
+    email: EmailStr
+    password: str
+    access_status: str = "active"
+    trading_status: str = "enabled"
+    subscription_status: str = "active"
 
 
-class AIDecisionOut(BaseModel):
-    ok: bool
-    ai_enabled: bool
+class MasterCustomerAccountUpsertIn(BaseModel):
+    customer_id: int
+    broker_name: Optional[str] = None
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class MasterCustomerStrategyUpsertIn(BaseModel):
+    customer_id: int
+    account_number: str
     symbol: str
-    side: str
-    model: Optional[str] = None
-    gate_level: Optional[str] = None
-    allow_new_entries: Optional[bool] = None
-    risk_level: Optional[str] = None
-    approved: bool
-    confidence: float
-    risk_mode: str
-    action: str
-    reason: str
-    raw_text: Optional[str] = None
+    strategy_code: str
+    strategy_name: str
+    magic: str
+    risk_tier: str = "balanced"
+    enabled: bool = True
+    sort_order: int = 999
+    base_lot: float = 0.01
+    max_lot: float = 1.0
+    color: str = "#D4AF37"
+    refresh_override_seconds: Optional[int] = None
+
+
+class CustomerAccountCreateIn(BaseModel):
+    broker_name: Optional[str] = None
+    account_number: str
+    account_label: str
+
+
+class CustomerStrategyUpsertIn(BaseModel):
+    account_number: str
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: str
+    risk_tier: str = "balanced"
+    enabled: bool = True
+    sort_order: int = 999
+    base_lot: float = 0.01
+    max_lot: float = 1.0
+    color: str = "#D4AF37"
+    refresh_override_seconds: Optional[int] = None
 
 
 # -------------------------------------------------------------------
@@ -1035,218 +793,41 @@ class AIDecisionOut(BaseModel):
 # -------------------------------------------------------------------
 @app.post("/login", response_model=TokenResponse)
 def login(data: LoginRequest):
-    identifier = (data.email or data.username or "").strip()
-    password = data.password.strip()
+    user = get_user_by_email(data.email.strip())
+    if not user or safe_str(user.get("password")) != data.password.strip():
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not identifier:
-        raise HTTPException(status_code=422, detail="email or username required")
+    access_token = create_access_token({
+        "sub": str(user["id"]),
+        "email": user["email"],
+        "role": user["role"],
+    })
 
-    user = get_user_by_login(identifier)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    if safe_int(user.get("is_active"), 0) != 1:
-        raise HTTPException(status_code=403, detail="User inactive")
-
-    if (user.get("password") or "") != password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    access_token = create_access_token(
-        {
-            "sub": str(user["id"]),
-            "email": user.get("email"),
-            "role": user.get("role"),
-        }
-    )
     return {
         "access_token": access_token,
-        "token_type": "bearer"
+        "token_type": "bearer",
     }
 
 
 @app.get("/me")
 def me(current_user: dict = Depends(get_current_user)):
-    return build_me_payload(current_user)
-
-
-@app.post("/ai/decision", response_model=AIDecisionOut)
-def ai_decision(data: AIDecisionIn):
-    symbol = data.symbol.strip().upper()
-    side = normalize_side(data.side)
-    score = safe_float(data.score, 1.0)
-
-    if side not in ("BUY", "SELL"):
-        raise HTTPException(status_code=422, detail="side must be BUY or SELL")
-
-    gate = gate_combo(symbol=symbol, account=data.account, magic=data.magic)
-    risk_engine = compute_risk_engine(symbol=symbol, account=data.account, magic=data.magic)
-
-    fallback_approved = bool(gate.get("allow_new_entries", False)) and score >= 0.60
-    fallback_action = "ALLOW" if fallback_approved else "BLOCK"
-
-    if not OPENAI_ENABLED:
-        return {
-            "ok": True,
-            "ai_enabled": False,
-            "symbol": symbol,
-            "side": side,
-            "model": None,
-            "gate_level": gate.get("gate_level"),
-            "allow_new_entries": gate.get("allow_new_entries"),
-            "risk_level": risk_engine.get("risk_level"),
-            "approved": fallback_approved,
-            "confidence": round(max(0.0, min(1.0, score)), 4),
-            "risk_mode": "fallback",
-            "action": fallback_action,
-            "reason": "OpenAI disabled, fallback decision used",
-            "raw_text": None,
-        }
-
-    system_prompt = """
-You are a trading decision support engine.
-You do NOT place trades.
-You evaluate whether a signal should be allowed, reduced, or blocked.
-
-Return ONLY valid JSON with these exact keys:
-approved
-confidence
-risk_mode
-action
-reason
-
-Rules:
-- approved must be true or false
-- confidence must be a number from 0.0 to 1.0
-- risk_mode must be one of: block, reduced, normal, aggressive
-- action must be one of: BLOCK, ALLOW, REDUCE
-- reason must be a short clear sentence
-- If gate_level is RED or allow_new_entries is false, action should normally be BLOCK
-- If risk_level is RED, action should normally be BLOCK
-- Consider score, gate state, risk state, and context together
-"""
-
-    user_payload = {
-        "symbol": symbol,
-        "side": side,
-        "score": score,
-        "gate": gate,
-        "risk_engine": risk_engine,
-        "context": data.context or {},
-    }
-
-    try:
-        client = get_openai_client()
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-        )
-
-        raw_text = extract_response_text(resp)
-        parsed = safe_json_loads(raw_text)
-
-        approved = bool(parsed.get("approved", fallback_approved))
-        confidence = safe_float(parsed.get("confidence"), score)
-        risk_mode = str(parsed.get("risk_mode", "normal")).strip().lower()
-        action = str(parsed.get("action", fallback_action)).strip().upper()
-        reason = str(parsed.get("reason", "AI decision generated")).strip()
-
-        if risk_mode not in ("block", "reduced", "normal", "aggressive"):
-            risk_mode = "normal"
-
-        if action not in ("BLOCK", "ALLOW", "REDUCE"):
-            action = fallback_action
-
-        return {
-            "ok": True,
-            "ai_enabled": True,
-            "symbol": symbol,
-            "side": side,
-            "model": OPENAI_MODEL,
-            "gate_level": gate.get("gate_level"),
-            "allow_new_entries": gate.get("allow_new_entries"),
-            "risk_level": risk_engine.get("risk_level"),
-            "approved": approved,
-            "confidence": round(max(0.0, min(1.0, confidence)), 4),
-            "risk_mode": risk_mode,
-            "action": action,
-            "reason": reason,
-            "raw_text": raw_text or None,
-        }
-
-    except Exception as e:
-        return {
-            "ok": True,
-            "ai_enabled": True,
-            "symbol": symbol,
-            "side": side,
-            "model": OPENAI_MODEL,
-            "gate_level": gate.get("gate_level"),
-            "allow_new_entries": gate.get("allow_new_entries"),
-            "risk_level": risk_engine.get("risk_level"),
-            "approved": fallback_approved,
-            "confidence": round(max(0.0, min(1.0, score)), 4),
-            "risk_mode": "fallback",
-            "action": fallback_action,
-            "reason": f"AI fallback used: {str(e)}",
-            "raw_text": None,
-        }
-
-
-@app.get("/master/customers")
-def master_customers(current_user: dict = Depends(require_master)):
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT *
-            FROM customers
-            ORDER BY id ASC
-            """
-        )
-        rows = cur.fetchall()
-        conn.close()
-
-    items = []
-    for customer in rows:
-        customer_id = int(customer["id"])
-        access = compute_customer_access(customer)
-
-        with DB_LOCK:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, username, email, role, is_active
-                FROM users
-                WHERE customer_id = ?
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (customer_id,),
-            )
-            user = cur.fetchone()
-            conn.close()
-
-        items.append({
-            "id": customer_id,
-            "code": customer.get("code"),
-            "display_name": customer.get("display_name"),
-            "email": customer.get("email"),
-            "notes": customer.get("notes"),
-            "user": user,
-            **access,
-            "accounts": get_customer_accounts(customer_id),
-            "strategies": get_customer_strategies(customer_id),
-        })
+    customer = None
+    if current_user.get("customer_id"):
+        customer = get_customer_by_id(int(current_user["customer_id"]))
 
     return {
-        "ok": True,
-        "count": len(items),
-        "items": items,
+        "id": current_user["id"],
+        "email": current_user["email"],
+        "role": current_user["role"],
+        "is_active": bool(current_user["is_active"]),
+        "customer_id": current_user.get("customer_id"),
+        "display_name": customer["display_name"] if customer else current_user["email"],
+        "access_status": customer["access_status"] if customer else "active",
+        "trading_status": customer["trading_status"] if customer else "enabled",
+        "subscription_status": customer["subscription_status"] if customer else "active",
+        "access_start_at": customer["access_start_at"] if customer else None,
+        "access_end_at": customer["access_end_at"] if customer else None,
+        "grace_until": customer["grace_until"] if customer else None,
     }
 
 
@@ -1258,786 +839,377 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "11.1.0",
+        "version": "12.0.0",
         "server_time_utc": utc_iso(),
-        "openai_enabled": OPENAI_ENABLED,
-        "openai_model": OPENAI_MODEL,
     }
 
 
 @app.get("/health")
 def health():
-    expire_old_signals_and_deliveries()
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "time": utc_iso()
+        "time": utc_iso(),
     }
 
 
 # -------------------------------------------------------------------
-# AUTHORIZED CONSUMERS
+# CUSTOMER ROUTES
 # -------------------------------------------------------------------
-def list_authorized_consumers(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        if symbol:
-            cur.execute("""
-            SELECT *
-            FROM authorized_consumers
-            WHERE symbol = ?
-            ORDER BY account, magic, symbol
-            """, (symbol.upper(),))
-        else:
-            cur.execute("""
-            SELECT *
-            FROM authorized_consumers
-            ORDER BY symbol, account, magic
-            """)
-        rows = cur.fetchall()
-        conn.close()
-    return rows
+@app.get("/customer/accounts")
+def customer_accounts(current_user: dict = Depends(require_customer)):
+    customer_id = current_user.get("customer_id")
+    if not customer_id:
+        raise HTTPException(status_code=404, detail="Customer not linked")
 
-
-def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
-    symbol = symbol.upper()
-    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-        SELECT *
-        FROM heartbeats
-        WHERE symbol = ?
-        ORDER BY id DESC
-        LIMIT 500
-        """, (symbol,))
-        rows = cur.fetchall()
-        conn.close()
-
-    latest_map = {}
-    for r in rows:
-        key = (r.get("account") or "", r.get("magic") or "", r.get("symbol") or "")
-        if key not in latest_map:
-            latest_map[key] = r
-
-    consumers = []
-    for _, r in latest_map.items():
-        last_seen = parse_dt(r.get("last_seen_utc"))
-        if not last_seen or last_seen < cutoff:
-            continue
-        account = (r.get("account") or "").strip()
-        magic = (r.get("magic") or "").strip()
-        hb_symbol = (r.get("symbol") or "").strip().upper()
-        if account and magic and hb_symbol == symbol:
-            consumers.append({
-                "account": account,
-                "magic": magic,
-                "symbol": hb_symbol,
-                "enabled": 1,
-                "owner_name": r.get("owner_name"),
-                "notes": "heartbeat_fallback"
-            })
-
-    unique_map = {}
-    for c in consumers:
-        key = (c["account"], c["magic"], c["symbol"])
-        if key not in unique_map:
-            unique_map[key] = c
-
-    return list(unique_map.values())
-
-
-def resolve_target_consumers(symbol: str) -> List[Dict[str, Any]]:
-    symbol = symbol.upper()
-    authorized = [
-        r for r in list_authorized_consumers(symbol=symbol)
-        if safe_int(r.get("enabled"), 0) == 1
-    ]
-
-    if authorized:
-        return authorized
-
-    if AUTHORIZED_CONSUMERS_STRICT:
-        return []
-
-    return get_live_heartbeat_consumers(symbol)
-
-
-@app.get("/consumers")
-def consumers(symbol: Optional[str] = Query(default=None)):
-    items = list_authorized_consumers(symbol=symbol)
     return {
         "ok": True,
-        "count": len(items),
-        "items": items
+        "items": build_customer_accounts_payload(int(customer_id)),
     }
 
 
-@app.post("/consumers/upsert")
-def consumers_upsert(
-    data: ConsumerUpsertIn,
-    _: bool = Depends(app_token_guard)
+@app.post("/customer/accounts/create")
+def customer_account_create(
+    data: CustomerAccountCreateIn,
+    current_user: dict = Depends(require_customer),
 ):
-    symbol = data.symbol.strip().upper()
-    account = data.account.strip()
-    magic = data.magic.strip()
-
-    if not symbol or not account or not magic:
-        raise HTTPException(status_code=422, detail="account, magic, symbol required")
-
+    customer_id = int(current_user["customer_id"])
     now = utc_iso()
+
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("""
-        INSERT INTO authorized_consumers(account, magic, symbol, enabled, owner_name, notes, created_utc, updated_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(account, magic, symbol) DO UPDATE SET
+        INSERT OR IGNORE INTO customer_accounts(
+            customer_id, broker_name, account_number, account_label, is_active, created_utc, updated_utc
+        )
+        VALUES (?, ?, ?, ?, 1, ?, ?)
+        """, (
+            customer_id,
+            data.broker_name,
+            data.account_number.strip(),
+            data.account_label.strip(),
+            now,
+            now,
+        ))
+        conn.commit()
+        conn.close()
+
+    write_audit_log(
+        actor_user_id=current_user["id"],
+        actor_role=current_user["role"],
+        target_customer_id=customer_id,
+        target_account_number=data.account_number.strip(),
+        action_type="customer_account_create",
+        message=f"Customer created account {data.account_number.strip()}",
+        payload=data.model_dump(),
+    )
+
+    return {"ok": True}
+
+
+@app.post("/customer/strategies/upsert")
+def customer_strategy_upsert(
+    data: CustomerStrategyUpsertIn,
+    current_user: dict = Depends(require_customer),
+):
+    customer_id = int(current_user["customer_id"])
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO customer_strategies(
+            customer_id, account_number, symbol, strategy_code, strategy_name, magic,
+            risk_tier, enabled, sort_order, base_lot, max_lot, color,
+            refresh_override_seconds, created_utc, updated_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(customer_id, account_number, symbol, strategy_code, magic)
+        DO UPDATE SET
+            strategy_name = excluded.strategy_name,
+            risk_tier = excluded.risk_tier,
             enabled = excluded.enabled,
-            owner_name = excluded.owner_name,
-            notes = excluded.notes,
+            sort_order = excluded.sort_order,
+            base_lot = excluded.base_lot,
+            max_lot = excluded.max_lot,
+            color = excluded.color,
+            refresh_override_seconds = excluded.refresh_override_seconds,
             updated_utc = excluded.updated_utc
         """, (
-            account,
-            magic,
-            symbol,
+            customer_id,
+            data.account_number.strip(),
+            data.symbol.strip().upper(),
+            data.strategy_code.strip(),
+            data.strategy_name.strip(),
+            data.magic.strip(),
+            data.risk_tier.strip(),
             1 if data.enabled else 0,
-            data.owner_name,
-            data.notes,
+            data.sort_order,
+            data.base_lot,
+            data.max_lot,
+            data.color.strip(),
+            data.refresh_override_seconds,
             now,
-            now
-        ))
-        conn.commit()
-        conn.close()
-
-    return {
-        "ok": True,
-        "account": account,
-        "magic": magic,
-        "symbol": symbol,
-        "enabled": data.enabled
-    }
-
-
-# -------------------------------------------------------------------
-# HEARTBEAT
-# -------------------------------------------------------------------
-@app.post("/hb")
-def heartbeat(data: HeartbeatPing):
-    if data.key and data.key != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid key")
-
-    now = utc_iso()
-    symbol = data.symbol.upper()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            symbol,
-            data.ea_name,
-            data.version,
             now,
-            data.status,
-            data.comment,
-            data.owner_name
         ))
-
         conn.commit()
         conn.close()
 
-    return {"ok": True, "server_time_utc": now}
-
-
-@app.post("/heartbeat")
-def heartbeat_alias(data: HeartbeatPing):
-    return heartbeat(data)
-
-
-@app.get("/status/heartbeat")
-def heartbeat_status(symbol: Optional[str] = Query(default=None)):
-    symbol_norm = symbol.strip().upper() if symbol else None
-    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        if symbol_norm:
-            cur.execute("""
-            SELECT * FROM heartbeats
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 500
-            """, (symbol_norm,))
-        else:
-            cur.execute("""
-            SELECT * FROM heartbeats
-            ORDER BY id DESC
-            LIMIT 1000
-            """)
-
-        rows = cur.fetchall()
-        conn.close()
-
-    latest_map = {}
-    for r in rows:
-        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
-        if key not in latest_map:
-            latest_map[key] = r
-
-    result = []
-    connected_count = 0
-
-    for _, r in latest_map.items():
-        last_seen = parse_dt(r["last_seen_utc"])
-        connected = bool(last_seen and last_seen >= cutoff)
-        if connected:
-            connected_count += 1
-
-        result.append({
-            "account": r.get("account"),
-            "magic": r.get("magic"),
-            "symbol": r.get("symbol"),
-            "ea_name": r.get("ea_name"),
-            "version": r.get("version"),
-            "last_seen_utc": r.get("last_seen_utc"),
-            "connected": connected,
-            "status": r.get("status"),
-            "comment": r.get("comment"),
-            "owner_name": r.get("owner_name"),
-        })
-
-    return {
-        "ok": True,
-        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
-        "connected_count": connected_count,
-        "items": result
-    }
-
-
-# -------------------------------------------------------------------
-# SIGNAL DISTRIBUTION
-# -------------------------------------------------------------------
-def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]]:
-    symbol = symbol.upper()
-    targets = resolve_target_consumers(symbol)
-    now = utc_iso()
-
-    created = []
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        for t in targets:
-            account = (t.get("account") or "").strip()
-            magic = (t.get("magic") or "").strip()
-            if not account or not magic:
-                continue
-
-            cur.execute("""
-            INSERT OR IGNORE INTO signal_deliveries(
-                signal_id, account, magic, symbol, delivery_status,
-                first_seen_utc, ack_utc, filled_utc, expire_utc,
-                updated_utc, created_utc, ticket, error_message
-            )
-            VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)
-            """, (
-                signal_id,
-                account,
-                magic,
-                symbol,
-                now,
-                now
-            ))
-
-            created.append({
-                "signal_id": signal_id,
-                "account": account,
-                "magic": magic,
-                "symbol": symbol
-            })
-
-        cur.execute("""
-        UPDATE signals
-        SET status = ?
-        WHERE id = ?
-        """, ("distributed" if created else "pending", signal_id))
-
-        conn.commit()
-        conn.close()
-
-    return created
-
-
-@app.post("/tv")
-def tv_signal(
-    data: TVSignalIn,
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
-):
-    expire_old_signals_and_deliveries()
-
-    provided_key = x_api_key or data.key
-    if provided_key != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    symbol = data.symbol.strip().upper()
-    side = normalize_side(data.side or data.action)
-
-    if side not in ("BUY", "SELL"):
-        raise HTTPException(status_code=422, detail="side/action must be BUY or SELL")
-
-    payload_dict = data.payload or {}
-    payload_dict["score"] = safe_float(data.score, 1.0)
-
-    payload_json = json.dumps(payload_dict, ensure_ascii=False)
-    now = utc_iso()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (symbol, side, payload_json, now, now))
-
-        signal_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-
-    deliveries = create_signal_deliveries(signal_id=signal_id, symbol=symbol)
-
-    return {
-        "ok": True,
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "side": side,
-        "created_utc": now,
-        "deliveries_created": len(deliveries),
-        "deliveries": deliveries
-    }
-
-
-def get_latest_delivery_for_consumer(symbol: str, account: str, magic: Optional[str]) -> Optional[Dict[str, Any]]:
-    magic = magic or ""
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-        SELECT d.*, s.side, s.payload_json, s.updated_utc AS signal_updated_utc, s.created_utc AS signal_created_utc, s.status AS signal_status
-        FROM signal_deliveries d
-        JOIN signals s ON s.id = d.signal_id
-        WHERE d.symbol = ?
-          AND d.account = ?
-          AND d.magic = ?
-          AND d.delivery_status IN ('pending', 'delivered')
-        ORDER BY d.id DESC
-        LIMIT 1
-        """, (symbol, account, magic))
-        row = cur.fetchone()
-        conn.close()
-
-    if row:
-        row["payload"] = load_signal_payload(row)
-    return row
-
-
-@app.get("/latest")
-def latest_signal(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    expire_old_signals_and_deliveries()
-
-    symbol = symbol.strip().upper()
-    account = account.strip()
-    magic = (magic or "").strip()
-
-    controls = get_runtime_controls(symbol)
-    gate_payload = gate_combo(symbol=symbol, account=account, magic=magic)
-
-    if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
-        return {
-            "ok": True,
-            "has_signal": False,
-            "symbol": symbol,
-            "blocked": True,
-            "controls": controls,
-            "gate": gate_payload
-        }
-
-    delivery = get_latest_delivery_for_consumer(symbol=symbol, account=account, magic=magic)
-
-    if not delivery:
-        return {
-            "ok": True,
-            "has_signal": False,
-            "symbol": symbol,
-            "blocked": False,
-            "controls": controls,
-            "gate": gate_payload
-        }
-
-    signal_created = parse_dt(delivery.get("signal_created_utc"))
-    if signal_created:
-        age_sec = int((now_utc() - signal_created).total_seconds())
-        if age_sec > SIGNAL_TTL_SEC:
-            with DB_LOCK:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute("""
-                UPDATE signal_deliveries
-                SET delivery_status = 'expired',
-                    expire_utc = ?,
-                    updated_utc = ?
-                WHERE id = ?
-                """, (utc_iso(), utc_iso(), delivery["id"]))
-                conn.commit()
-                conn.close()
-
-            return {
-                "ok": True,
-                "has_signal": False,
-                "blocked": True,
-                "reason": "TTL_EXPIRED",
-                "ttl_sec": SIGNAL_TTL_SEC,
-                "signal_age_sec": age_sec,
-                "symbol": symbol,
-                "controls": controls,
-                "gate": gate_payload
-            }
-
-    signal_row = {
-        "id": delivery["signal_id"],
-        "symbol": symbol,
-        "side": delivery.get("side"),
-        "payload": delivery.get("payload", {}),
-        "created_utc": delivery.get("signal_created_utc"),
-        "updated_utc": delivery.get("signal_updated_utc"),
-        "status": delivery.get("signal_status"),
-    }
-
-    filter_result = signal_passes_filter(signal_row, gate_payload)
-
-    if not filter_result["approved"]:
-        return {
-            "ok": True,
-            "has_signal": False,
-            "blocked": True,
-            "reason": filter_result["reason"],
-            "filter": filter_result,
-            "symbol": symbol,
-            "controls": controls,
-            "gate": gate_payload,
-            "delivery": {
-                "delivery_id": delivery["id"],
-                "signal_id": delivery["signal_id"],
-                "delivery_status": delivery["delivery_status"],
-            }
-        }
-
-    execution_engine = compute_execution_engine(signal_row, gate_payload)
-
-    if not execution_engine["approved"]:
-        return {
-            "ok": True,
-            "has_signal": False,
-            "blocked": True,
-            "reason": "EXECUTION_ENGINE_BLOCK",
-            "execution_engine": execution_engine,
-            "symbol": symbol,
-            "controls": controls,
-            "gate": gate_payload,
-            "delivery": {
-                "delivery_id": delivery["id"],
-                "signal_id": delivery["signal_id"],
-                "delivery_status": delivery["delivery_status"],
-            }
-        }
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-        UPDATE signal_deliveries
-        SET delivery_status = CASE
-                WHEN delivery_status = 'pending' THEN 'delivered'
-                ELSE delivery_status
-            END,
-            first_seen_utc = COALESCE(first_seen_utc, ?),
-            updated_utc = ?
-        WHERE id = ?
-        """, (utc_iso(), utc_iso(), delivery["id"]))
-        conn.commit()
-        conn.close()
-
-    effective_risk_multiplier = (
-        safe_float(controls["risk_multiplier"], 1.0)
-        * safe_float(gate_payload.get("risk_multiplier"), 1.0)
-        * safe_float(execution_engine.get("risk_multiplier"), 1.0)
+    write_audit_log(
+        actor_user_id=current_user["id"],
+        actor_role=current_user["role"],
+        target_customer_id=customer_id,
+        target_account_number=data.account_number.strip(),
+        action_type="customer_strategy_upsert",
+        message=f"Customer upserted strategy {data.strategy_code.strip()} on {data.account_number.strip()}",
+        payload=data.model_dump(),
     )
-
-    return {
-        "ok": True,
-        "has_signal": True,
-        "blocked": False,
-        "filter": filter_result,
-        "execution_engine": execution_engine,
-        "effective_risk_multiplier": round(effective_risk_multiplier, 4),
-        "symbol": symbol,
-        "controls": controls,
-        "gate": gate_payload,
-        "delivery": {
-            "delivery_id": delivery["id"],
-            "signal_id": delivery["signal_id"],
-            "delivery_status": delivery["delivery_status"],
-            "first_seen_utc": delivery.get("first_seen_utc"),
-            "ack_utc": delivery.get("ack_utc"),
-        },
-        "signal": signal_row
-    }
-
-
-@app.post("/ack")
-def ack_signal(data: AckIn):
-    expire_old_signals_and_deliveries()
-
-    symbol = data.symbol.strip().upper()
-    account = data.account.strip()
-    magic = (data.magic or "").strip()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        SELECT d.*, s.updated_utc AS signal_updated_utc
-        FROM signal_deliveries d
-        JOIN signals s ON s.id = d.signal_id
-        WHERE d.symbol = ?
-          AND d.account = ?
-          AND d.magic = ?
-          AND s.updated_utc = ?
-          AND d.delivery_status IN ('pending', 'delivered')
-        ORDER BY d.id DESC
-        LIMIT 1
-        """, (symbol, account, magic, data.updated_utc))
-
-        row = cur.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Delivery not found")
-
-        delivery_id = row["id"]
-        signal_id = row["signal_id"]
-        ack_time = utc_iso()
-
-        cur.execute("""
-        UPDATE signal_deliveries
-        SET delivery_status = 'acked',
-            ack_utc = ?,
-            ticket = COALESCE(?, ticket),
-            updated_utc = ?
-        WHERE id = ?
-        """, (ack_time, data.ticket, ack_time, delivery_id))
-
-        cur.execute("""
-        INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc, delivery_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (signal_id, symbol, account, magic, ack_time, delivery_id))
-
-        cur.execute("""
-        UPDATE signals
-        SET status = CASE
-            WHEN EXISTS (
-                SELECT 1
-                FROM signal_deliveries d
-                WHERE d.signal_id = signals.id
-                  AND d.delivery_status IN ('pending', 'delivered', 'acked')
-            ) THEN 'distributed'
-            ELSE 'closed'
-        END
-        WHERE id = ?
-        """, (signal_id,))
-
-        conn.commit()
-        conn.close()
-
-    return {
-        "ok": True,
-        "signal_id": signal_id,
-        "delivery_id": delivery_id,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic
-    }
-
-
-# -------------------------------------------------------------------
-# DEALS + RISKS
-# -------------------------------------------------------------------
-def resolve_signal_id_for_deal(account: Optional[str], magic: Optional[str], symbol: str, explicit_signal_id: Optional[int]) -> Optional[int]:
-    if explicit_signal_id:
-        return explicit_signal_id
-
-    account = (account or "").strip()
-    magic = (magic or "").strip()
-    symbol = symbol.upper()
-
-    if not account or not magic:
-        return None
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-        SELECT *
-        FROM signal_deliveries
-        WHERE account = ?
-          AND magic = ?
-          AND symbol = ?
-          AND delivery_status = 'acked'
-        ORDER BY ack_utc DESC, id DESC
-        LIMIT 1
-        """, (account, magic, symbol))
-        row = cur.fetchone()
-        conn.close()
-
-    if row:
-        return row["signal_id"]
-    return None
-
-
-@app.post("/deal")
-def post_deal(data: DealIn):
-    deal_time = data.deal_time_utc or utc_iso()
-    symbol = data.symbol.upper()
-    resolved_signal_id = resolve_signal_id_for_deal(
-        account=data.account,
-        magic=data.magic,
-        symbol=symbol,
-        explicit_signal_id=data.signal_id
-    )
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO deals(
-            account, magic, symbol, side, ticket, volume,
-            entry_price, exit_price, sl, tp,
-            pnl, pnl_currency, commission, swap,
-            risk_amount, r_multiple, strategy,
-            deal_time_utc, created_utc, signal_id
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            symbol,
-            data.side,
-            data.ticket,
-            data.volume,
-            data.entry_price,
-            data.exit_price,
-            data.sl,
-            data.tp,
-            data.pnl,
-            data.pnl_currency,
-            data.commission,
-            data.swap,
-            data.risk_amount,
-            data.r_multiple,
-            data.strategy,
-            deal_time,
-            utc_iso(),
-            resolved_signal_id
-        ))
-
-        if resolved_signal_id and data.account and data.magic:
-            cur.execute("""
-            UPDATE signal_deliveries
-            SET delivery_status = 'filled',
-                filled_utc = ?,
-                ticket = COALESCE(?, ticket),
-                updated_utc = ?
-            WHERE signal_id = ?
-              AND account = ?
-              AND magic = ?
-              AND symbol = ?
-              AND delivery_status IN ('acked', 'delivered', 'pending')
-            """, (
-                utc_iso(),
-                data.ticket,
-                utc_iso(),
-                resolved_signal_id,
-                data.account,
-                data.magic,
-                symbol
-            ))
-
-            cur.execute("""
-            UPDATE signals
-            SET status = CASE
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM signal_deliveries d
-                    WHERE d.signal_id = signals.id
-                      AND d.delivery_status IN ('pending', 'delivered', 'acked')
-                ) THEN 'distributed'
-                ELSE 'closed'
-            END
-            WHERE id = ?
-            """, (resolved_signal_id,))
-
-        conn.commit()
-        conn.close()
-
-    return {"ok": True, "signal_id": resolved_signal_id}
-
-
-@app.post("/risk")
-def post_risk(data: RiskIn):
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            data.symbol.upper(),
-            data.event_type,
-            data.level,
-            data.message,
-            data.value,
-            utc_iso()
-        ))
-
-        conn.commit()
-        conn.close()
 
     return {"ok": True}
 
 
 # -------------------------------------------------------------------
-# KPI CORE
+# MASTER ROUTES
 # -------------------------------------------------------------------
+@app.get("/master/customers")
+def master_customers(current_user: dict = Depends(require_master)):
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT c.*, u.email
+        FROM customers c
+        LEFT JOIN users u ON u.customer_id = c.id AND u.role = 'customer'
+        ORDER BY c.display_name
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+    return {"ok": True, "items": rows}
+
+
+@app.post("/master/customers/create")
+def master_customer_create(
+    data: MasterCustomerCreateIn,
+    current_user: dict = Depends(require_master),
+):
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT id FROM users WHERE lower(email) = lower(?)", (data.email.strip(),))
+        exists = cur.fetchone()
+        if exists:
+            conn.close()
+            raise HTTPException(status_code=409, detail="Email already exists")
+
+        cur.execute("""
+        INSERT INTO customers(
+            display_name, access_start_at, access_end_at, access_status,
+            trading_status, subscription_status, grace_until, created_utc, updated_utc
+        )
+        VALUES (?, ?, NULL, ?, ?, ?, NULL, ?, ?)
+        """, (
+            data.display_name.strip(),
+            now,
+            data.access_status.strip(),
+            data.trading_status.strip(),
+            data.subscription_status.strip(),
+            now,
+            now,
+        ))
+        customer_id = cur.lastrowid
+
+        cur.execute("""
+        INSERT INTO users(email, password, role, customer_id, is_active, created_utc, updated_utc)
+        VALUES (?, ?, 'customer', ?, 1, ?, ?)
+        """, (
+            data.email.strip(),
+            data.password.strip(),
+            customer_id,
+            now,
+            now,
+        ))
+
+        conn.commit()
+        conn.close()
+
+    write_audit_log(
+        actor_user_id=current_user["id"],
+        actor_role=current_user["role"],
+        target_customer_id=customer_id,
+        action_type="master_customer_create",
+        message=f"Master created customer {data.display_name.strip()}",
+        payload=data.model_dump(exclude={"password"}),
+    )
+
+    return {"ok": True, "customer_id": customer_id}
+
+
+@app.post("/master/customer/account/upsert")
+def master_customer_account_upsert(
+    data: MasterCustomerAccountUpsertIn,
+    current_user: dict = Depends(require_master),
+):
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO customer_accounts(
+            customer_id, broker_name, account_number, account_label, is_active, created_utc, updated_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(customer_id, account_number)
+        DO UPDATE SET
+            broker_name = excluded.broker_name,
+            account_label = excluded.account_label,
+            is_active = excluded.is_active,
+            updated_utc = excluded.updated_utc
+        """, (
+            data.customer_id,
+            data.broker_name,
+            data.account_number.strip(),
+            data.account_label.strip(),
+            1 if data.is_active else 0,
+            now,
+            now,
+        ))
+        conn.commit()
+        conn.close()
+
+    write_audit_log(
+        actor_user_id=current_user["id"],
+        actor_role=current_user["role"],
+        target_customer_id=data.customer_id,
+        target_account_number=data.account_number.strip(),
+        action_type="master_customer_account_upsert",
+        message=f"Master upserted account {data.account_number.strip()}",
+        payload=data.model_dump(),
+    )
+
+    return {"ok": True}
+
+
+@app.post("/master/customer/strategy/upsert")
+def master_customer_strategy_upsert(
+    data: MasterCustomerStrategyUpsertIn,
+    current_user: dict = Depends(require_master),
+):
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO customer_strategies(
+            customer_id, account_number, symbol, strategy_code, strategy_name, magic,
+            risk_tier, enabled, sort_order, base_lot, max_lot, color,
+            refresh_override_seconds, created_utc, updated_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(customer_id, account_number, symbol, strategy_code, magic)
+        DO UPDATE SET
+            strategy_name = excluded.strategy_name,
+            risk_tier = excluded.risk_tier,
+            enabled = excluded.enabled,
+            sort_order = excluded.sort_order,
+            base_lot = excluded.base_lot,
+            max_lot = excluded.max_lot,
+            color = excluded.color,
+            refresh_override_seconds = excluded.refresh_override_seconds,
+            updated_utc = excluded.updated_utc
+        """, (
+            data.customer_id,
+            data.account_number.strip(),
+            data.symbol.strip().upper(),
+            data.strategy_code.strip(),
+            data.strategy_name.strip(),
+            data.magic.strip(),
+            data.risk_tier.strip(),
+            1 if data.enabled else 0,
+            data.sort_order,
+            data.base_lot,
+            data.max_lot,
+            data.color.strip(),
+            data.refresh_override_seconds,
+            now,
+            now,
+        ))
+        conn.commit()
+        conn.close()
+
+    write_audit_log(
+        actor_user_id=current_user["id"],
+        actor_role=current_user["role"],
+        target_customer_id=data.customer_id,
+        target_account_number=data.account_number.strip(),
+        action_type="master_customer_strategy_upsert",
+        message=f"Master upserted strategy {data.strategy_code.strip()} on {data.account_number.strip()}",
+        payload=data.model_dump(),
+    )
+
+    return {"ok": True}
+
+
+@app.get("/master/customer/{customer_id}/accounts")
+def master_customer_accounts(
+    customer_id: int,
+    current_user: dict = Depends(require_master),
+):
+    return {
+        "ok": True,
+        "items": build_customer_accounts_payload(customer_id),
+    }
+
+
+@app.get("/master/audit_logs")
+def master_audit_logs(
+    target_customer_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=100),
+    current_user: dict = Depends(require_master),
+):
+    limit = max(1, min(limit, 500))
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        query = "SELECT * FROM audit_logs WHERE 1=1"
+        params: List[Any] = []
+
+        if target_customer_id is not None:
+            query += " AND target_customer_id = ?"
+            params.append(target_customer_id)
+
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    return {"ok": True, "items": rows}
+
+
+# -------------------------------------------------------------------
+# RUNTIME / KPI / RISK / GATE
+# -------------------------------------------------------------------
+def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "paused": DEFAULT_PAUSED,
+        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
+        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
+        "symbol": symbol.upper() if symbol else None,
+        "source": "default_env",
+    }
+
+
 def get_deals_filtered(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
@@ -2047,12 +1219,8 @@ def get_deals_filtered(
 ):
     dt_from = now_utc() - timedelta(days=lookback_days)
 
-    query = """
-    SELECT *
-    FROM deals
-    WHERE deal_time_utc >= ?
-    """
-    params = [utc_iso(dt_from)]
+    query = "SELECT * FROM deals WHERE deal_time_utc >= ?"
+    params: List[Any] = [utc_iso(dt_from)]
 
     if symbol:
         query += " AND symbol = ?"
@@ -2086,12 +1254,8 @@ def get_deals_today(
 ):
     dt_from = utc_day_start()
 
-    query = """
-    SELECT *
-    FROM deals
-    WHERE deal_time_utc >= ?
-    """
-    params = [utc_iso(dt_from)]
+    query = "SELECT * FROM deals WHERE deal_time_utc >= ?"
+    params: List[Any] = [utc_iso(dt_from)]
 
     if symbol:
         query += " AND symbol = ?"
@@ -2180,7 +1344,6 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = 0
     losses = 0
     breakeven = 0
-
     gross_profit = 0.0
     gross_loss = 0.0
     net_pnl = 0.0
@@ -2212,7 +1375,6 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_dd_pct = calc_max_drawdown_pct(curve)
     max_loss_streak = calc_loss_streak(rows)
     current_loss_streak = calc_current_loss_streak(rows)
-
     last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
@@ -2242,7 +1404,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": DEFAULT_GATE_LEVEL,
             "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
             "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"]
+            "reasons": ["AUTO_GATE_DISABLED"],
         }
 
     reasons_red = []
@@ -2268,7 +1430,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "RED",
             "allow_new_entries": False,
             "risk_multiplier": 0.0,
-            "reasons": reasons_red
+            "reasons": reasons_red,
         }
 
     if dd_pct >= YELLOW_DD_PCT:
@@ -2285,14 +1447,14 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
             "gate_level": "YELLOW",
             "allow_new_entries": True,
             "risk_multiplier": 0.5,
-            "reasons": reasons_yellow
+            "reasons": reasons_yellow,
         }
 
     return {
         "gate_level": "GREEN",
         "allow_new_entries": True,
         "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"]
+        "reasons": ["NORMAL"],
     }
 
 
@@ -2308,21 +1470,13 @@ def compute_auto_gate(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
-
     kpis = summarize_kpis(rows)
     gate = auto_gate_from_kpis(kpis)
-
-    return {
-        "kpis": kpis,
-        "gate": gate
-    }
+    return {"kpis": kpis, "gate": gate}
 
 
-# -------------------------------------------------------------------
-# RISK ENGINE
-# -------------------------------------------------------------------
 def compute_risk_engine(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
@@ -2355,7 +1509,7 @@ def compute_risk_engine(
                 "daily_r_cap": DAILY_R_CAP,
                 "daily_max_trades": DAILY_MAX_TRADES,
             },
-            "reasons": ["RISK_ENGINE_DISABLED"]
+            "reasons": ["RISK_ENGINE_DISABLED"],
         }
 
     if daily_pnl <= -abs(DAILY_LOSS_CAP_USD):
@@ -2388,20 +1542,16 @@ def compute_risk_engine(
             "daily_r_cap": DAILY_R_CAP,
             "daily_max_trades": DAILY_MAX_TRADES,
         },
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
-# -------------------------------------------------------------------
-# EXECUTION ENGINE
-# -------------------------------------------------------------------
 def compute_execution_engine(
     signal_row: Optional[Dict[str, Any]] = None,
     gate_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = (signal_row or {}).get("payload", {}) or {}
     score = safe_float(payload.get("score"), 1.0)
-
     gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
 
     mode = EXECUTION_MODE
@@ -2417,7 +1567,7 @@ def compute_execution_engine(
             "priority": "BLOCKED",
             "risk_multiplier": 0.0,
             "approved": False,
-            "reasons": ["GATE_RED"]
+            "reasons": ["GATE_RED"],
         }
 
     if not SCORE_TO_RISK_ENABLED:
@@ -2428,19 +1578,17 @@ def compute_execution_engine(
             "priority": "NORMAL",
             "risk_multiplier": RISK_MULTIPLIER_NORMAL,
             "approved": True,
-            "reasons": ["SCORE_TO_RISK_DISABLED"]
+            "reasons": ["SCORE_TO_RISK_DISABLED"],
         }
 
     if mode == "safe":
         risk_multiplier = min(RISK_MULTIPLIER_LOW, RISK_MULTIPLIER_NORMAL)
         priority = "LOW"
         reasons.append("MODE_SAFE")
-
     elif mode == "normal":
         risk_multiplier = RISK_MULTIPLIER_NORMAL
         priority = "NORMAL"
         reasons.append("MODE_NORMAL")
-
     elif mode == "aggressive":
         if score >= SCORE_HIGH_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_HIGH
@@ -2450,7 +1598,6 @@ def compute_execution_engine(
             risk_multiplier = RISK_MULTIPLIER_NORMAL
             priority = "NORMAL"
             reasons.append("MODE_AGGRESSIVE_NORMAL_SCORE")
-
     else:
         if score < SCORE_LOW_THRESHOLD:
             risk_multiplier = RISK_MULTIPLIER_LOW
@@ -2478,22 +1625,672 @@ def compute_execution_engine(
         "priority": priority,
         "risk_multiplier": round(risk_multiplier, 4),
         "approved": True,
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
 # -------------------------------------------------------------------
-# CONTROLS + GATES
+# CONSUMERS / HEARTBEAT / SIGNALS
+# -------------------------------------------------------------------
+def list_authorized_consumers(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        if symbol:
+            cur.execute("""
+            SELECT *
+            FROM authorized_consumers
+            WHERE symbol = ?
+            ORDER BY account, magic, symbol
+            """, (symbol.upper(),))
+        else:
+            cur.execute("""
+            SELECT *
+            FROM authorized_consumers
+            ORDER BY symbol, account, magic
+            """)
+        rows = cur.fetchall()
+        conn.close()
+    return rows
+
+
+def get_live_heartbeat_consumers(symbol: str) -> List[Dict[str, Any]]:
+    symbol = symbol.upper()
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT *
+        FROM heartbeats
+        WHERE symbol = ?
+        ORDER BY id DESC
+        LIMIT 500
+        """, (symbol,))
+        rows = cur.fetchall()
+        conn.close()
+
+    latest_map = {}
+    for r in rows:
+        key = (r.get("account") or "", r.get("magic") or "", r.get("symbol") or "")
+        if key not in latest_map:
+            latest_map[key] = r
+
+    consumers = []
+    for r in latest_map.values():
+        last_seen = parse_dt(r.get("last_seen_utc"))
+        if not last_seen or last_seen < cutoff:
+            continue
+
+        account = safe_str(r.get("account"))
+        magic = safe_str(r.get("magic"))
+        hb_symbol = safe_str(r.get("symbol")).upper()
+
+        if account and magic and hb_symbol == symbol:
+            consumers.append({
+                "account": account,
+                "magic": magic,
+                "symbol": hb_symbol,
+                "enabled": 1,
+                "owner_name": r.get("owner_name"),
+                "notes": "heartbeat_fallback",
+            })
+
+    unique_map = {}
+    for c in consumers:
+        key = (c["account"], c["magic"], c["symbol"])
+        if key not in unique_map:
+            unique_map[key] = c
+
+    return list(unique_map.values())
+
+
+def resolve_target_consumers(symbol: str) -> List[Dict[str, Any]]:
+    symbol = symbol.upper()
+    authorized = [
+        r for r in list_authorized_consumers(symbol=symbol)
+        if safe_int(r.get("enabled"), 0) == 1
+    ]
+
+    if authorized:
+        return authorized
+
+    if AUTHORIZED_CONSUMERS_STRICT:
+        return []
+
+    return get_live_heartbeat_consumers(symbol)
+
+
+@app.get("/consumers")
+def consumers(symbol: Optional[str] = Query(default=None)):
+    items = list_authorized_consumers(symbol=symbol)
+    return {"ok": True, "count": len(items), "items": items}
+
+
+@app.post("/consumers/upsert")
+def consumers_upsert(
+    data: ConsumerUpsertIn,
+    _: bool = Depends(app_token_guard),
+):
+    symbol = data.symbol.strip().upper()
+    account = data.account.strip()
+    magic = data.magic.strip()
+
+    if not symbol or not account or not magic:
+        raise HTTPException(status_code=422, detail="account, magic, symbol required")
+
+    now = utc_iso()
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO authorized_consumers(account, magic, symbol, enabled, owner_name, notes, created_utc, updated_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account, magic, symbol) DO UPDATE SET
+            enabled = excluded.enabled,
+            owner_name = excluded.owner_name,
+            notes = excluded.notes,
+            updated_utc = excluded.updated_utc
+        """, (
+            account,
+            magic,
+            symbol,
+            1 if data.enabled else 0,
+            data.owner_name,
+            data.notes,
+            now,
+            now,
+        ))
+        conn.commit()
+        conn.close()
+
+    return {
+        "ok": True,
+        "account": account,
+        "magic": magic,
+        "symbol": symbol,
+        "enabled": data.enabled,
+    }
+
+
+@app.post("/hb")
+def heartbeat(data: HeartbeatPing):
+    if data.key and data.key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid key")
+
+    now = utc_iso()
+    symbol = data.symbol.upper()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            symbol,
+            data.ea_name,
+            data.version,
+            now,
+            data.status,
+            data.comment,
+            data.owner_name,
+        ))
+        conn.commit()
+        conn.close()
+
+    return {"ok": True, "server_time_utc": now}
+
+
+@app.get("/status/heartbeat")
+def heartbeat_status(symbol: Optional[str] = Query(default=None)):
+    symbol_norm = symbol.strip().upper() if symbol else None
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        if symbol_norm:
+            cur.execute("""
+            SELECT * FROM heartbeats
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 500
+            """, (symbol_norm,))
+        else:
+            cur.execute("""
+            SELECT * FROM heartbeats
+            ORDER BY id DESC
+            LIMIT 1000
+            """)
+
+        rows = cur.fetchall()
+        conn.close()
+
+    latest_map = {}
+    for r in rows:
+        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
+        if key not in latest_map:
+            latest_map[key] = r
+
+    result = []
+    connected_count = 0
+
+    for r in latest_map.values():
+        last_seen = parse_dt(r["last_seen_utc"])
+        connected = bool(last_seen and last_seen >= cutoff)
+        if connected:
+            connected_count += 1
+
+        result.append({
+            "account": r.get("account"),
+            "magic": r.get("magic"),
+            "symbol": r.get("symbol"),
+            "ea_name": r.get("ea_name"),
+            "version": r.get("version"),
+            "last_seen_utc": r.get("last_seen_utc"),
+            "connected": connected,
+            "status": r.get("status"),
+            "comment": r.get("comment"),
+            "owner_name": r.get("owner_name"),
+        })
+
+    return {
+        "ok": True,
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "connected_count": connected_count,
+        "items": result,
+    }
+
+
+def signal_passes_filter(signal_row: Dict[str, Any], gate_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = signal_row.get("payload", {}) or {}
+    score = safe_float(payload.get("score"), 1.0)
+    gate_level = ((gate_payload or {}).get("gate_level") or "UNKNOWN").upper()
+
+    if gate_level == "RED":
+        return {"approved": False, "reason": "GATE_RED", "score": score}
+    if score < 0.60:
+        return {"approved": False, "reason": "SCORE_LT_0_60", "score": score}
+    if gate_level == "YELLOW" and score < 0.75:
+        return {"approved": False, "reason": "YELLOW_SCORE_LT_0_75", "score": score}
+    return {"approved": True, "reason": "APPROVED", "score": score}
+
+
+def create_signal_deliveries(signal_id: int, symbol: str) -> List[Dict[str, Any]]:
+    symbol = symbol.upper()
+    targets = resolve_target_consumers(symbol)
+    now = utc_iso()
+    created = []
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        for t in targets:
+            account = safe_str(t.get("account"))
+            magic = safe_str(t.get("magic"))
+            if not account or not magic:
+                continue
+
+            cur.execute("""
+            INSERT OR IGNORE INTO signal_deliveries(
+                signal_id, account, magic, symbol, delivery_status,
+                first_seen_utc, ack_utc, filled_utc, expire_utc,
+                updated_utc, created_utc, ticket, error_message
+            )
+            VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)
+            """, (
+                signal_id,
+                account,
+                magic,
+                symbol,
+                now,
+                now,
+            ))
+
+            created.append({
+                "signal_id": signal_id,
+                "account": account,
+                "magic": magic,
+                "symbol": symbol,
+            })
+
+        cur.execute("""
+        UPDATE signals
+        SET status = ?
+        WHERE id = ?
+        """, ("distributed" if created else "pending", signal_id))
+
+        conn.commit()
+        conn.close()
+
+    return created
+
+
+@app.post("/tv")
+def tv_signal(
+    data: TVSignalIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+):
+    provided_key = x_api_key or data.key
+    if provided_key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    symbol = data.symbol.strip().upper()
+    side = normalize_side(data.side or data.action)
+
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail="side/action must be BUY or SELL")
+
+    payload_dict = data.payload or {}
+    payload_dict["score"] = safe_float(data.score, 1.0)
+    payload_json = json.dumps(payload_dict, ensure_ascii=False)
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (symbol, side, payload_json, now, now))
+        signal_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+    deliveries = create_signal_deliveries(signal_id=signal_id, symbol=symbol)
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "created_utc": now,
+        "deliveries_created": len(deliveries),
+        "deliveries": deliveries,
+    }
+
+
+def get_latest_delivery_for_consumer(symbol: str, account: str, magic: Optional[str]) -> Optional[Dict[str, Any]]:
+    magic = magic or ""
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT d.*, s.side, s.payload_json, s.updated_utc AS signal_updated_utc,
+               s.created_utc AS signal_created_utc, s.status AS signal_status
+        FROM signal_deliveries d
+        JOIN signals s ON s.id = d.signal_id
+        WHERE d.symbol = ?
+          AND d.account = ?
+          AND d.magic = ?
+          AND d.delivery_status IN ('pending', 'delivered')
+        ORDER BY d.id DESC
+        LIMIT 1
+        """, (symbol, account, magic))
+        row = cur.fetchone()
+        conn.close()
+
+    if row:
+        row["payload"] = load_signal_payload(row)
+    return row
+
+
+@app.get("/latest")
+def latest_signal(
+    symbol: str = Query(...),
+    account: str = Query(...),
+    magic: Optional[str] = Query(default=None),
+):
+    symbol = symbol.strip().upper()
+    account = account.strip()
+    magic = (magic or "").strip()
+
+    controls = get_runtime_controls(symbol)
+    gate_payload = gate_combo(symbol=symbol, account=account, magic=magic)
+
+    if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "symbol": symbol,
+            "blocked": True,
+            "controls": controls,
+            "gate": gate_payload,
+        }
+
+    delivery = get_latest_delivery_for_consumer(symbol=symbol, account=account, magic=magic)
+
+    if not delivery:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "symbol": symbol,
+            "blocked": False,
+            "controls": controls,
+            "gate": gate_payload,
+        }
+
+    signal_row = {
+        "id": delivery["signal_id"],
+        "symbol": symbol,
+        "side": delivery.get("side"),
+        "payload": delivery.get("payload", {}),
+        "created_utc": delivery.get("signal_created_utc"),
+        "updated_utc": delivery.get("signal_updated_utc"),
+        "status": delivery.get("signal_status"),
+    }
+
+    filter_result = signal_passes_filter(signal_row, gate_payload)
+    execution_engine = compute_execution_engine(signal_row, gate_payload)
+
+    if not filter_result["approved"]:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": True,
+            "reason": filter_result["reason"],
+            "filter": filter_result,
+            "symbol": symbol,
+            "controls": controls,
+            "gate": gate_payload,
+            "delivery": {
+                "delivery_id": delivery["id"],
+                "signal_id": delivery["signal_id"],
+                "delivery_status": delivery["delivery_status"],
+            },
+        }
+
+    if not execution_engine["approved"]:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": True,
+            "reason": "EXECUTION_ENGINE_BLOCK",
+            "execution_engine": execution_engine,
+            "symbol": symbol,
+            "controls": controls,
+            "gate": gate_payload,
+            "delivery": {
+                "delivery_id": delivery["id"],
+                "signal_id": delivery["signal_id"],
+                "delivery_status": delivery["delivery_status"],
+            },
+        }
+
+    effective_risk_multiplier = (
+        safe_float(controls["risk_multiplier"], 1.0)
+        * safe_float(gate_payload.get("risk_multiplier"), 1.0)
+        * safe_float(execution_engine.get("risk_multiplier"), 1.0)
+    )
+
+    return {
+        "ok": True,
+        "has_signal": True,
+        "blocked": False,
+        "filter": filter_result,
+        "execution_engine": execution_engine,
+        "effective_risk_multiplier": round(effective_risk_multiplier, 4),
+        "symbol": symbol,
+        "controls": controls,
+        "gate": gate_payload,
+        "delivery": {
+            "delivery_id": delivery["id"],
+            "signal_id": delivery["signal_id"],
+            "delivery_status": delivery["delivery_status"],
+            "first_seen_utc": delivery.get("first_seen_utc"),
+            "ack_utc": delivery.get("ack_utc"),
+        },
+        "signal": signal_row,
+    }
+
+
+@app.post("/ack")
+def ack_signal(data: AckIn):
+    symbol = data.symbol.strip().upper()
+    account = data.account.strip()
+    magic = (data.magic or "").strip()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        SELECT d.*, s.updated_utc AS signal_updated_utc
+        FROM signal_deliveries d
+        JOIN signals s ON s.id = d.signal_id
+        WHERE d.symbol = ?
+          AND d.account = ?
+          AND d.magic = ?
+          AND s.updated_utc = ?
+          AND d.delivery_status IN ('pending', 'delivered')
+        ORDER BY d.id DESC
+        LIMIT 1
+        """, (symbol, account, magic, data.updated_utc))
+
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Delivery not found")
+
+        delivery_id = row["id"]
+        signal_id = row["signal_id"]
+        ack_time = utc_iso()
+
+        cur.execute("""
+        UPDATE signal_deliveries
+        SET delivery_status = 'acked',
+            ack_utc = ?,
+            ticket = COALESCE(?, ticket),
+            updated_utc = ?
+        WHERE id = ?
+        """, (ack_time, data.ticket, ack_time, delivery_id))
+
+        cur.execute("""
+        INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc)
+        VALUES (?, ?, ?, ?, ?)
+        """, (signal_id, symbol, account, magic, ack_time))
+
+        conn.commit()
+        conn.close()
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "delivery_id": delivery_id,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic,
+    }
+
+
+# -------------------------------------------------------------------
+# DEAL / RISK
+# -------------------------------------------------------------------
+def resolve_signal_id_for_deal(
+    account: Optional[str],
+    magic: Optional[str],
+    symbol: str,
+    explicit_signal_id: Optional[int],
+) -> Optional[int]:
+    if explicit_signal_id:
+        return explicit_signal_id
+
+    account = safe_str(account)
+    magic = safe_str(magic)
+    symbol = symbol.upper()
+
+    if not account or not magic:
+        return None
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT *
+        FROM signal_deliveries
+        WHERE account = ?
+          AND magic = ?
+          AND symbol = ?
+          AND delivery_status = 'acked'
+        ORDER BY ack_utc DESC, id DESC
+        LIMIT 1
+        """, (account, magic, symbol))
+        row = cur.fetchone()
+        conn.close()
+
+    return row["signal_id"] if row else None
+
+
+@app.post("/deal")
+def post_deal(data: DealIn):
+    deal_time = data.deal_time_utc or utc_iso()
+    symbol = data.symbol.upper()
+    resolved_signal_id = resolve_signal_id_for_deal(
+        account=data.account,
+        magic=data.magic,
+        symbol=symbol,
+        explicit_signal_id=data.signal_id,
+    )
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO deals(
+            account, magic, symbol, side, ticket, volume,
+            entry_price, exit_price, sl, tp,
+            pnl, pnl_currency, commission, swap,
+            risk_amount, r_multiple, strategy,
+            deal_time_utc, created_utc, signal_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            symbol,
+            data.side,
+            data.ticket,
+            data.volume,
+            data.entry_price,
+            data.exit_price,
+            data.sl,
+            data.tp,
+            data.pnl,
+            data.pnl_currency,
+            data.commission,
+            data.swap,
+            data.risk_amount,
+            data.r_multiple,
+            data.strategy,
+            deal_time,
+            utc_iso(),
+            resolved_signal_id,
+        ))
+        conn.commit()
+        conn.close()
+
+    return {"ok": True, "signal_id": resolved_signal_id}
+
+
+@app.post("/risk")
+def post_risk(data: RiskIn):
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.event_type,
+            data.level,
+            data.message,
+            data.value,
+            utc_iso(),
+        ))
+        conn.commit()
+        conn.close()
+
+    return {"ok": True}
+
+
+# -------------------------------------------------------------------
+# STATUS / KPI / DEBUG
 # -------------------------------------------------------------------
 @app.get("/controls/effective")
 def controls_effective(
     symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard)
+    _: bool = Depends(app_token_guard),
 ):
-    return {
-        "ok": True,
-        "controls": get_runtime_controls(symbol)
-    }
+    return {"ok": True, "controls": get_runtime_controls(symbol)}
 
 
 @app.get("/status/gate_auto")
@@ -2509,7 +2306,7 @@ def gate_auto(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     return {
@@ -2522,7 +2319,7 @@ def gate_auto(
             "limit_trades": limit_trades,
         },
         "kpis": result["kpis"],
-        "gate": result["gate"]
+        "gate": result["gate"],
     }
 
 
@@ -2540,7 +2337,7 @@ def status_risk_engine(
             "account": account,
             "magic": magic,
         },
-        "risk_engine": result
+        "risk_engine": result,
     }
 
 
@@ -2551,16 +2348,15 @@ def status_execution_engine(
 ):
     dummy_signal = {"payload": {"score": score}}
     dummy_gate = {"gate_level": gate_level.upper()}
-
     result = compute_execution_engine(dummy_signal, dummy_gate)
 
     return {
         "ok": True,
         "input": {
             "score": score,
-            "gate_level": gate_level.upper()
+            "gate_level": gate_level.upper(),
         },
-        "execution_engine": result
+        "execution_engine": result,
     }
 
 
@@ -2584,7 +2380,9 @@ def gate_combo(
     final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
 
     gate_level = auto_gate["gate_level"]
-    if paused or not risk_allow:
+    if paused:
+        gate_level = "RED"
+    if not risk_allow:
         gate_level = "RED"
 
     reasons = []
@@ -2606,13 +2404,10 @@ def gate_combo(
         "controls": controls,
         "auto_gate": auto_gate,
         "risk_engine": risk_engine,
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
-# -------------------------------------------------------------------
-# KPI ENDPOINTS
-# -------------------------------------------------------------------
 @app.get("/kpis/rolling")
 def rolling_kpis(
     symbol: Optional[str] = Query(default=None),
@@ -2626,9 +2421,8 @@ def rolling_kpis(
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
-
     kpis = summarize_kpis(rows)
 
     return {
@@ -2640,7 +2434,7 @@ def rolling_kpis(
             "lookback_days": lookback_days,
             "limit_trades": limit_trades,
         },
-        "kpis": kpis
+        "kpis": kpis,
     }
 
 
@@ -2652,14 +2446,12 @@ def system_overview(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    expire_old_signals_and_deliveries()
-
     rows = get_deals_filtered(
         symbol=symbol,
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
     kpis = summarize_kpis(rows)
@@ -2686,16 +2478,12 @@ def system_overview(
         "controls": get_runtime_controls(symbol),
         "kpis": kpis,
         "gate": gate,
-        "risk_engine": risk_engine
+        "risk_engine": risk_engine,
     }
 
 
-# -------------------------------------------------------------------
-# DEBUG ENDPOINTS
-# -------------------------------------------------------------------
 @app.get("/debug/state")
 def debug_state(symbol: str = Query(...)):
-    expire_old_signals_and_deliveries()
     symbol = symbol.strip().upper()
 
     with DB_LOCK:
@@ -2729,7 +2517,7 @@ def debug_state(symbol: str = Query(...)):
         "ok": True,
         "symbol": symbol,
         "signals": signals,
-        "deliveries": deliveries
+        "deliveries": deliveries,
     }
 
 
@@ -2744,7 +2532,7 @@ def debug_recent_acks(
         cur = conn.cursor()
 
         query = "SELECT * FROM signal_acks WHERE 1=1"
-        params = []
+        params: List[Any] = []
 
         if symbol:
             query += " AND symbol = ?"
@@ -2764,7 +2552,7 @@ def debug_recent_acks(
     return {
         "ok": True,
         "count": len(rows),
-        "items": rows
+        "items": rows,
     }
 
 
@@ -2796,7 +2584,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
         "ok": True,
         "signal": signal_row,
         "delivery_count": len(deliveries),
-        "deliveries": deliveries
+        "deliveries": deliveries,
     }
 
 
@@ -2804,7 +2592,7 @@ def debug_delivery_status(signal_id: int = Query(...)):
 def debug_pending_by_consumer(
     account: str = Query(...),
     magic: str = Query(...),
-    symbol: str = Query(...)
+    symbol: str = Query(...),
 ):
     with DB_LOCK:
         conn = get_conn()
@@ -2832,5 +2620,5 @@ def debug_pending_by_consumer(
     return {
         "ok": True,
         "count": len(rows),
-        "items": rows
+        "items": rows,
     }
