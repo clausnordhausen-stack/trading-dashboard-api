@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="Signal Agent API", version="6.4.0")
+app = FastAPI(title="Signal Agent API", version="6.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,14 +37,37 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 # IN-MEMORY DEMO DATA
 # =========================================================
 
-FAKE_USERS: Dict[str, Dict[str, str]] = {
+FAKE_USERS: Dict[str, Dict[str, Any]] = {
     "test@test.com": {
         "password": "123456",
         "role": "customer",
+        "customer_id": 1,
+        "display_name": "Test Customer",
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
     },
     "admin@claus.digital": {
         "password": "123456",
         "role": "master",
+        "customer_id": None,
+        "display_name": "Master Admin",
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
+    },
+}
+
+FAKE_CUSTOMERS: Dict[int, Dict[str, Any]] = {
+    1: {
+        "id": 1,
+        "display_name": "Test Customer",
+        "access_start_at": None,
+        "access_end_at": None,
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
+        "grace_until": None,
     },
 }
 
@@ -54,11 +77,17 @@ FAKE_CUSTOMER_ACCOUNTS: Dict[str, List[Dict[str, Any]]] = {
             "id": 1,
             "account_number": "10001",
             "broker": "IC Markets",
+            "broker_name": "IC Markets",
+            "account_label": "IC Markets • 10001",
+            "is_active": True,
         },
         {
             "id": 2,
             "account_number": "10002",
             "broker": "FTMO",
+            "broker_name": "FTMO",
+            "account_label": "FTMO • 10002",
+            "is_active": True,
         },
     ],
     "admin@claus.digital": [
@@ -66,6 +95,9 @@ FAKE_CUSTOMER_ACCOUNTS: Dict[str, List[Dict[str, Any]]] = {
             "id": 10,
             "account_number": "90001",
             "broker": "Master View",
+            "broker_name": "Master View",
+            "account_label": "Master View • 90001",
+            "is_active": True,
         },
     ],
 }
@@ -73,38 +105,74 @@ FAKE_CUSTOMER_ACCOUNTS: Dict[str, List[Dict[str, Any]]] = {
 FAKE_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
     1: [
         {
+            "id": 1,
+            "account_id": 1,
             "symbol": "XAUUSD",
             "name": "Gold Core",
+            "strategy_name": "Gold Core",
+            "strategy_code": "xau_core",
             "magic": "61001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
         {
+            "id": 2,
+            "account_id": 1,
             "symbol": "BTCUSD",
             "name": "BTC Core",
+            "strategy_name": "BTC Core",
+            "strategy_code": "btc_core",
             "magic": "61002",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
     ],
     2: [
         {
+            "id": 3,
+            "account_id": 2,
             "symbol": "XAUUSD",
             "name": "Gold Core",
+            "strategy_name": "Gold Core",
+            "strategy_code": "xau_core",
             "magic": "61001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
         {
+            "id": 4,
+            "account_id": 2,
             "symbol": "BTCUSD",
             "name": "BTC Core",
+            "strategy_name": "BTC Core",
+            "strategy_code": "btc_core",
             "magic": "61002",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
     ],
     10: [
         {
+            "id": 5,
+            "account_id": 10,
             "symbol": "XAUUSD",
             "name": "Gold Master",
+            "strategy_name": "Gold Master",
+            "strategy_code": "xau_core",
             "magic": "777",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
         {
+            "id": 6,
+            "account_id": 10,
             "symbol": "BTCUSD",
             "name": "BTC Master",
+            "strategy_name": "BTC Master",
+            "strategy_code": "btc_core",
             "magic": "62001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
         },
     ],
 }
@@ -146,6 +214,8 @@ FAKE_CUSTOMER_SETUP: Dict[str, Dict[int, Dict[str, Dict[str, Any]]]] = {
     },
 }
 
+AUDIT_LOGS: List[Dict[str, Any]] = []
+
 # runtime memory for signals / heartbeats / acks
 SIGNALS: List[Dict[str, Any]] = []
 SIGNAL_ACKS: List[Dict[str, Any]] = []
@@ -168,6 +238,40 @@ class LoginResponse(BaseModel):
 class StrategySetupIn(BaseModel):
     enabled: bool
     risk_tier: str
+
+
+class CustomerAccountCreate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class CustomerAccountUpdate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class CustomerStrategyCreate(BaseModel):
+    account_id: Optional[int] = None
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
+
+
+class CustomerStrategyUpdate(BaseModel):
+    account_id: Optional[int] = None
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
 
 
 class TVSignalIn(BaseModel):
@@ -243,12 +347,26 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token payload")
 
+        user = FAKE_USERS.get(email)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+
         return {
             "email": email,
             "role": role,
+            "customer_id": user.get("customer_id"),
+            "display_name": user.get("display_name", email),
+            "access_status": user.get("access_status", "active"),
+            "trading_status": user.get("trading_status", "enabled"),
+            "subscription_status": user.get("subscription_status", "active"),
         }
     except JWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
+
+
+def require_customer(current_user: Dict[str, Any]) -> None:
+    if current_user["role"] != "customer":
+        raise HTTPException(status_code=403, detail="Not allowed")
 
 
 def get_user_accounts(email: str) -> List[Dict[str, Any]]:
@@ -290,18 +408,27 @@ def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
         for strategy in base_strategies:
             symbol = strategy["symbol"].upper()
             setup = get_strategy_setup(email, account_id, symbol)
+            strategy_name = strategy.get("strategy_name") or strategy.get("name") or symbol
+            strategy_code = strategy.get("strategy_code") or ("btc_core" if symbol == "BTCUSD" else "xau_core")
+            magic_value = str(strategy.get("magic", ""))
+            strategy_enabled = bool(strategy.get("is_enabled", True)) and bool(setup["enabled"])
+            risk_tier = setup["risk_tier"]
 
             enriched_strategies.append(
                 {
+                    "id": strategy.get("id"),
+                    "account_id": strategy.get("account_id", account_id),
                     "symbol": symbol,
-                    "displayName": strategy["name"],
-                    "name": strategy["name"],
-                    "magic": str(strategy["magic"]),
-                    "enabled": bool(setup["enabled"]),
-                    "riskTier": setup["risk_tier"],
-                    "risk_tier": setup["risk_tier"],
-                    "strategyCode": "btc_core" if symbol == "BTCUSD" else "xau_core",
-                    "strategy_code": "btc_core" if symbol == "BTCUSD" else "xau_core",
+                    "displayName": strategy_name,
+                    "name": strategy_name,
+                    "strategy_name": strategy_name,
+                    "magic": magic_value,
+                    "enabled": strategy_enabled,
+                    "is_enabled": bool(strategy.get("is_enabled", True)),
+                    "riskTier": risk_tier,
+                    "risk_tier": risk_tier,
+                    "strategyCode": strategy_code,
+                    "strategy_code": strategy_code,
                     "sortOrder": 2 if symbol == "BTCUSD" else 1,
                     "sort_order": 2 if symbol == "BTCUSD" else 1,
                     "baseLot": 0.01,
@@ -316,9 +443,12 @@ def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
             {
                 "id": account_id,
                 "account_number": account["account_number"],
-                "label": f'{account["broker"]} • {account["account_number"]}',
-                "broker": account["broker"],
-                "enabled": True,
+                "label": f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+                "broker": account.get("broker_name") or account.get("broker"),
+                "broker_name": account.get("broker_name") or account.get("broker"),
+                "account_label": account.get("account_label") or f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+                "enabled": bool(account.get("is_active", True)),
+                "is_active": bool(account.get("is_active", True)),
                 "symbols": enriched_strategies,
             }
         )
@@ -470,6 +600,90 @@ def build_mock_heartbeat_item(symbol: str) -> Dict[str, Any]:
     }
 
 
+def next_account_id() -> int:
+    all_ids: List[int] = []
+    for items in FAKE_CUSTOMER_ACCOUNTS.values():
+        for item in items:
+            all_ids.append(int(item["id"]))
+    return (max(all_ids) if all_ids else 0) + 1
+
+
+def next_strategy_id() -> int:
+    all_ids: List[int] = []
+    for items in FAKE_ACCOUNT_STRATEGIES.values():
+        for item in items:
+            if item.get("id") is not None:
+                all_ids.append(int(item["id"]))
+    return (max(all_ids) if all_ids else 0) + 1
+
+
+def normalize_risk_tier(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("conservative", "balanced", "dynamic", "aggressive"):
+        raise HTTPException(status_code=422, detail="Invalid risk_tier")
+    return normalized
+
+
+def find_account_for_user(email: str, account_id: int) -> Dict[str, Any]:
+    for account in get_user_accounts(email):
+        if int(account["id"]) == account_id:
+            return account
+    raise HTTPException(status_code=404, detail="Account not found")
+
+
+def find_strategy_for_user(email: str, strategy_id: int) -> Dict[str, Any]:
+    for account in get_user_accounts(email):
+        account_id = int(account["id"])
+        for strategy in get_account_strategies(account_id):
+            if int(strategy.get("id", 0)) == strategy_id:
+                return strategy
+    raise HTTPException(status_code=404, detail="Strategy not found")
+
+
+def write_audit_log(
+    actor_email: str,
+    action_type: str,
+    message: str,
+    target_account_id: Optional[int] = None,
+    target_strategy_id: Optional[int] = None,
+) -> None:
+    AUDIT_LOGS.append(
+        {
+            "created_utc": now_utc_iso(),
+            "actor_email": actor_email,
+            "action_type": action_type,
+            "message": message,
+            "target_account_id": target_account_id,
+            "target_strategy_id": target_strategy_id,
+        }
+    )
+
+
+def format_account_payload(account: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(account["id"]),
+        "account_number": account["account_number"],
+        "broker": account.get("broker_name") or account.get("broker"),
+        "broker_name": account.get("broker_name") or account.get("broker"),
+        "account_label": account.get("account_label") or f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+        "is_active": bool(account.get("is_active", True)),
+    }
+
+
+def format_strategy_payload(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(strategy["id"]),
+        "account_id": strategy.get("account_id"),
+        "symbol": strategy["symbol"].upper(),
+        "strategy_code": strategy.get("strategy_code") or ("btc_core" if strategy["symbol"].upper() == "BTCUSD" else "xau_core"),
+        "strategy_name": strategy.get("strategy_name") or strategy.get("name") or strategy["symbol"].upper(),
+        "name": strategy.get("strategy_name") or strategy.get("name") or strategy["symbol"].upper(),
+        "magic": str(strategy.get("magic", "")),
+        "risk_tier": strategy.get("risk_tier", "balanced"),
+        "is_enabled": bool(strategy.get("is_enabled", True)),
+    }
+
+
 # =========================================================
 # BASIC
 # =========================================================
@@ -479,7 +693,7 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "version": "6.4.0",
+        "version": "6.5.0",
         "server_time_utc": now_utc_iso(),
     }
 
@@ -521,10 +735,11 @@ def me(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, An
     return {
         "email": email,
         "role": role,
-        "display_name": email,
-        "access_status": "active",
-        "trading_status": "enabled",
-        "subscription_status": "active",
+        "customer_id": current_user.get("customer_id"),
+        "display_name": current_user.get("display_name", email),
+        "access_status": current_user.get("access_status", "active"),
+        "trading_status": current_user.get("trading_status", "enabled"),
+        "subscription_status": current_user.get("subscription_status", "active"),
     }
 
 
@@ -546,6 +761,288 @@ def get_strategies(
 ) -> List[Dict[str, Any]]:
     ensure_account_access(current_user["email"], account_id)
     return get_account_strategies(account_id)
+
+
+@app.get("/customer/accounts")
+def get_customer_accounts(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_customer(current_user)
+    return [format_account_payload(item) for item in get_user_accounts(current_user["email"])]
+
+
+@app.post("/customer/accounts")
+def create_customer_account(
+    data: CustomerAccountCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+
+    accounts = FAKE_CUSTOMER_ACCOUNTS.setdefault(email, [])
+    if any(item["account_number"] == account_number for item in accounts):
+        raise HTTPException(status_code=400, detail="Account number already exists")
+
+    account_id = next_account_id()
+    row = {
+        "id": account_id,
+        "account_number": account_number,
+        "broker": broker_name,
+        "broker_name": broker_name,
+        "account_label": account_label,
+        "is_active": bool(data.is_active),
+    }
+    accounts.append(row)
+    FAKE_ACCOUNT_STRATEGIES.setdefault(account_id, [])
+    FAKE_CUSTOMER_SETUP.setdefault(email, {}).setdefault(account_id, {})
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_account_created",
+        message=f"Created account {account_number}",
+        target_account_id=account_id,
+    )
+
+    return format_account_payload(row)
+
+
+@app.put("/customer/accounts/{account_id}")
+def update_customer_account(
+    account_id: int,
+    data: CustomerAccountUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+
+    account = find_account_for_user(email, account_id)
+
+    for item in get_user_accounts(email):
+        if int(item["id"]) != account_id and item["account_number"] == account_number:
+            raise HTTPException(status_code=400, detail="Account number already exists")
+
+    account["broker"] = broker_name
+    account["broker_name"] = broker_name
+    account["account_number"] = account_number
+    account["account_label"] = account_label
+    account["is_active"] = bool(data.is_active)
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_account_updated",
+        message=f"Updated account {account_number}",
+        target_account_id=account_id,
+    )
+
+    return format_account_payload(account)
+
+
+@app.delete("/customer/accounts/{account_id}")
+def disable_customer_account(
+    account_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    account = find_account_for_user(email, account_id)
+    account["is_active"] = False
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_account_disabled",
+        message=f"Disabled account {account['account_number']}",
+        target_account_id=account_id,
+    )
+
+    return {
+        "ok": True,
+        "message": "Account disabled",
+        "account_id": account_id,
+    }
+
+
+@app.get("/customer/strategies")
+def get_customer_strategies(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    rows: List[Dict[str, Any]] = []
+
+    for account in get_user_accounts(email):
+        account_id = int(account["id"])
+        for strategy in get_account_strategies(account_id):
+            rows.append(format_strategy_payload(strategy))
+
+    rows.sort(key=lambda x: (int(x["account_id"] or 0), x["symbol"], str(x["magic"])))
+    return rows
+
+
+@app.post("/customer/strategies")
+def create_customer_strategy(
+    data: CustomerStrategyCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    account_id = data.account_id
+    if account_id is None:
+        raise HTTPException(status_code=422, detail="account_id is required")
+
+    ensure_account_access(email, account_id)
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+
+    strategies = FAKE_ACCOUNT_STRATEGIES.setdefault(account_id, [])
+    for item in strategies:
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    strategy_id = next_strategy_id()
+    row = {
+        "id": strategy_id,
+        "account_id": account_id,
+        "symbol": symbol,
+        "name": strategy_name,
+        "strategy_name": strategy_name,
+        "strategy_code": strategy_code,
+        "magic": magic,
+        "risk_tier": risk_tier,
+        "is_enabled": bool(data.is_enabled),
+    }
+    strategies.append(row)
+
+    setup = get_strategy_setup(email, account_id, symbol)
+    setup["enabled"] = bool(data.is_enabled)
+    setup["risk_tier"] = risk_tier
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_strategy_created",
+        message=f"Created strategy {strategy_code} for {symbol}",
+        target_account_id=account_id,
+        target_strategy_id=strategy_id,
+    )
+
+    return format_strategy_payload(row)
+
+
+@app.put("/customer/strategies/{strategy_id}")
+def update_customer_strategy(
+    strategy_id: int,
+    data: CustomerStrategyUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    strategy = find_strategy_for_user(email, strategy_id)
+
+    new_account_id = data.account_id if data.account_id is not None else strategy.get("account_id")
+    if new_account_id is None:
+        raise HTTPException(status_code=422, detail="account_id is required")
+
+    ensure_account_access(email, int(new_account_id))
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+
+    old_account_id = int(strategy.get("account_id"))
+    target_account_id = int(new_account_id)
+
+    if target_account_id != old_account_id:
+        old_list = FAKE_ACCOUNT_STRATEGIES.setdefault(old_account_id, [])
+        old_list[:] = [item for item in old_list if int(item.get("id", 0)) != strategy_id]
+        FAKE_ACCOUNT_STRATEGIES.setdefault(target_account_id, []).append(strategy)
+
+    for item in FAKE_ACCOUNT_STRATEGIES.setdefault(target_account_id, []):
+        if int(item.get("id", 0)) == strategy_id:
+            continue
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    strategy["account_id"] = target_account_id
+    strategy["symbol"] = symbol
+    strategy["name"] = strategy_name
+    strategy["strategy_name"] = strategy_name
+    strategy["strategy_code"] = strategy_code
+    strategy["magic"] = magic
+    strategy["risk_tier"] = risk_tier
+    strategy["is_enabled"] = bool(data.is_enabled)
+
+    setup = get_strategy_setup(email, target_account_id, symbol)
+    setup["enabled"] = bool(data.is_enabled)
+    setup["risk_tier"] = risk_tier
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_strategy_updated",
+        message=f"Updated strategy {strategy_code} for {symbol}",
+        target_account_id=target_account_id,
+        target_strategy_id=strategy_id,
+    )
+
+    return format_strategy_payload(strategy)
+
+
+@app.delete("/customer/strategies/{strategy_id}")
+def disable_customer_strategy(
+    strategy_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_customer(current_user)
+
+    email = current_user["email"]
+    strategy = find_strategy_for_user(email, strategy_id)
+    strategy["is_enabled"] = False
+
+    account_id = int(strategy.get("account_id"))
+    setup = get_strategy_setup(email, account_id, strategy["symbol"])
+    setup["enabled"] = False
+
+    write_audit_log(
+        actor_email=email,
+        action_type="customer_strategy_disabled",
+        message=f"Disabled strategy {strategy.get('strategy_code') or strategy.get('name')}",
+        target_account_id=account_id,
+        target_strategy_id=strategy_id,
+    )
+
+    return {
+        "ok": True,
+        "message": "Strategy disabled",
+        "strategy_id": strategy_id,
+    }
 
 
 @app.get("/customer/setup")
@@ -582,6 +1079,11 @@ def update_strategy_setup(
     setup = get_strategy_setup(email, account_id, symbol_upper)
     setup["enabled"] = bool(data.enabled)
     setup["risk_tier"] = normalized_risk
+
+    for strategy in get_account_strategies(account_id):
+        if strategy["symbol"].upper() == symbol_upper:
+            strategy["risk_tier"] = normalized_risk
+            strategy["is_enabled"] = bool(data.enabled)
 
     return {
         "ok": True,
@@ -1083,3 +1585,4 @@ def debug_pending_by_consumer(
             "symbol": symbol_upper,
         },
     }
+}
