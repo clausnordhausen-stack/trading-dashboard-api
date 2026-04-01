@@ -1585,4 +1585,4 @@ def debug_pending_by_consumer(
             "symbol": symbol_upper,
         },
     }
-}
+
