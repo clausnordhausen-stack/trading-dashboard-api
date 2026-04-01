@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="Signal Agent API", version="6.5.0")
+app = FastAPI(title="Signal Agent API", version="6.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -274,6 +274,33 @@ class CustomerStrategyUpdate(BaseModel):
     is_enabled: bool = True
 
 
+class MasterCustomerCreate(BaseModel):
+    display_name: str
+    access_start_at: Optional[str] = None
+    access_end_at: Optional[str] = None
+    access_status: str = "active"
+    trading_status: str = "enabled"
+    subscription_status: str = "active"
+    grace_until: Optional[str] = None
+
+
+class MasterCustomerUpdate(BaseModel):
+    display_name: str
+    access_start_at: Optional[str] = None
+    access_end_at: Optional[str] = None
+    access_status: str = "active"
+    trading_status: str = "enabled"
+    subscription_status: str = "active"
+    grace_until: Optional[str] = None
+
+
+class MasterUserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: str
+    customer_id: int
+
+
 class TVSignalIn(BaseModel):
     key: Optional[str] = None
     symbol: str
@@ -366,6 +393,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
 
 def require_customer(current_user: Dict[str, Any]) -> None:
     if current_user["role"] != "customer":
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def require_master(current_user: Dict[str, Any]) -> None:
+    if current_user["role"] != "master":
         raise HTTPException(status_code=403, detail="Not allowed")
 
 
@@ -600,6 +632,11 @@ def build_mock_heartbeat_item(symbol: str) -> Dict[str, Any]:
     }
 
 
+def next_customer_id() -> int:
+    ids = [int(customer_id) for customer_id in FAKE_CUSTOMERS.keys()]
+    return (max(ids) if ids else 0) + 1
+
+
 def next_account_id() -> int:
     all_ids: List[int] = []
     for items in FAKE_CUSTOMER_ACCOUNTS.values():
@@ -621,6 +658,27 @@ def normalize_risk_tier(value: str) -> str:
     normalized = value.strip().lower()
     if normalized not in ("conservative", "balanced", "dynamic", "aggressive"):
         raise HTTPException(status_code=422, detail="Invalid risk_tier")
+    return normalized
+
+
+def normalize_access_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("active", "disabled", "expired", "paused"):
+        raise HTTPException(status_code=422, detail="Invalid access_status")
+    return normalized
+
+
+def normalize_trading_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("enabled", "disabled", "paused"):
+        raise HTTPException(status_code=422, detail="Invalid trading_status")
+    return normalized
+
+
+def normalize_subscription_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("active", "trial", "expired", "cancelled", "grace"):
+        raise HTTPException(status_code=422, detail="Invalid subscription_status")
     return normalized
 
 
@@ -646,6 +704,8 @@ def write_audit_log(
     message: str,
     target_account_id: Optional[int] = None,
     target_strategy_id: Optional[int] = None,
+    target_customer_id: Optional[int] = None,
+    target_user_email: Optional[str] = None,
 ) -> None:
     AUDIT_LOGS.append(
         {
@@ -653,6 +713,8 @@ def write_audit_log(
             "actor_email": actor_email,
             "action_type": action_type,
             "message": message,
+            "target_customer_id": target_customer_id,
+            "target_user_email": target_user_email,
             "target_account_id": target_account_id,
             "target_strategy_id": target_strategy_id,
         }
@@ -684,6 +746,81 @@ def format_strategy_payload(strategy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def get_customer_user_emails(customer_id: int) -> List[str]:
+    emails: List[str] = []
+    for email, user in FAKE_USERS.items():
+        if user.get("customer_id") == customer_id and user.get("role") == "customer":
+            emails.append(email)
+    return emails
+
+
+def get_primary_customer_email(customer_id: int) -> Optional[str]:
+    emails = get_customer_user_emails(customer_id)
+    return emails[0] if emails else None
+
+
+def find_customer(customer_id: int) -> Dict[str, Any]:
+    customer = FAKE_CUSTOMERS.get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return customer
+
+
+def format_customer_payload(customer: Dict[str, Any]) -> Dict[str, Any]:
+    customer_id = int(customer["id"])
+    user_emails = get_customer_user_emails(customer_id)
+
+    return {
+        "id": customer_id,
+        "display_name": customer["display_name"],
+        "access_start_at": customer.get("access_start_at"),
+        "access_end_at": customer.get("access_end_at"),
+        "access_status": customer.get("access_status", "active"),
+        "trading_status": customer.get("trading_status", "enabled"),
+        "subscription_status": customer.get("subscription_status", "active"),
+        "grace_until": customer.get("grace_until"),
+        "user_count": len(user_emails),
+        "user_emails": user_emails,
+    }
+
+
+def sync_customer_status_to_users(customer_id: int) -> None:
+    customer = find_customer(customer_id)
+    for email, user in FAKE_USERS.items():
+        if user.get("customer_id") == customer_id:
+            user["display_name"] = customer.get("display_name", user.get("display_name", email))
+            user["access_status"] = customer.get("access_status", "active")
+            user["trading_status"] = customer.get("trading_status", "enabled")
+            user["subscription_status"] = customer.get("subscription_status", "active")
+
+
+def get_accounts_for_customer(customer_id: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            rows.append(format_account_payload(account))
+    rows.sort(key=lambda x: int(x["id"]))
+    return rows
+
+
+def get_strategies_for_customer(customer_id: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            account_id = int(account["id"])
+            for strategy in get_account_strategies(account_id):
+                strategy_id = int(strategy.get("id", 0))
+                if strategy_id in seen_ids:
+                    continue
+                seen_ids.add(strategy_id)
+                rows.append(format_strategy_payload(strategy))
+
+    rows.sort(key=lambda x: (int(x["account_id"] or 0), x["symbol"], str(x["magic"])))
+    return rows
+
+
 # =========================================================
 # BASIC
 # =========================================================
@@ -693,7 +830,7 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "service": "signal-agent-api",
-        "version": "6.5.0",
+        "version": "6.6.0",
         "server_time_utc": now_utc_iso(),
     }
 
@@ -718,6 +855,11 @@ def login(data: LoginRequest) -> Dict[str, str]:
     user = FAKE_USERS.get(email)
     if not user or user["password"] != password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if user.get("role") == "customer":
+        access_status = user.get("access_status", "active")
+        if access_status != "active":
+            raise HTTPException(status_code=403, detail=f"Customer access is {access_status}")
 
     token = create_token(email=email, role=user["role"])
 
@@ -808,6 +950,7 @@ def create_customer_account(
         action_type="customer_account_created",
         message=f"Created account {account_number}",
         target_account_id=account_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return format_account_payload(row)
@@ -846,6 +989,7 @@ def update_customer_account(
         action_type="customer_account_updated",
         message=f"Updated account {account_number}",
         target_account_id=account_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return format_account_payload(account)
@@ -867,6 +1011,7 @@ def disable_customer_account(
         action_type="customer_account_disabled",
         message=f"Disabled account {account['account_number']}",
         target_account_id=account_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return {
@@ -946,6 +1091,7 @@ def create_customer_strategy(
         message=f"Created strategy {strategy_code} for {symbol}",
         target_account_id=account_id,
         target_strategy_id=strategy_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return format_strategy_payload(row)
@@ -1010,6 +1156,7 @@ def update_customer_strategy(
         message=f"Updated strategy {strategy_code} for {symbol}",
         target_account_id=target_account_id,
         target_strategy_id=strategy_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return format_strategy_payload(strategy)
@@ -1036,6 +1183,7 @@ def disable_customer_strategy(
         message=f"Disabled strategy {strategy.get('strategy_code') or strategy.get('name')}",
         target_account_id=account_id,
         target_strategy_id=strategy_id,
+        target_customer_id=current_user.get("customer_id"),
     )
 
     return {
@@ -1091,6 +1239,181 @@ def update_strategy_setup(
         "symbol": symbol_upper,
         "enabled": setup["enabled"],
         "risk_tier": setup["risk_tier"],
+    }
+
+
+# =========================================================
+# MASTER ADMIN (AUTH REQUIRED)
+# =========================================================
+
+@app.get("/master/customers")
+def master_get_customers(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    rows = [format_customer_payload(customer) for customer in FAKE_CUSTOMERS.values()]
+    rows.sort(key=lambda x: int(x["id"]))
+    return rows
+
+
+@app.post("/master/customers")
+def master_create_customer(
+    data: MasterCustomerCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+
+    display_name = data.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="display_name is required")
+
+    customer_id = next_customer_id()
+    row = {
+        "id": customer_id,
+        "display_name": display_name,
+        "access_start_at": data.access_start_at,
+        "access_end_at": data.access_end_at,
+        "access_status": normalize_access_status(data.access_status),
+        "trading_status": normalize_trading_status(data.trading_status),
+        "subscription_status": normalize_subscription_status(data.subscription_status),
+        "grace_until": data.grace_until,
+    }
+    FAKE_CUSTOMERS[customer_id] = row
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_customer_created",
+        message=f"Created customer {display_name}",
+        target_customer_id=customer_id,
+    )
+
+    return format_customer_payload(row)
+
+
+@app.get("/master/customers/{customer_id}")
+def master_get_customer(
+    customer_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+    customer = find_customer(customer_id)
+    return format_customer_payload(customer)
+
+
+@app.put("/master/customers/{customer_id}")
+def master_update_customer(
+    customer_id: int,
+    data: MasterCustomerUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+
+    customer = find_customer(customer_id)
+    display_name = data.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="display_name is required")
+
+    customer["display_name"] = display_name
+    customer["access_start_at"] = data.access_start_at
+    customer["access_end_at"] = data.access_end_at
+    customer["access_status"] = normalize_access_status(data.access_status)
+    customer["trading_status"] = normalize_trading_status(data.trading_status)
+    customer["subscription_status"] = normalize_subscription_status(data.subscription_status)
+    customer["grace_until"] = data.grace_until
+
+    sync_customer_status_to_users(customer_id)
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_customer_updated",
+        message=f"Updated customer {display_name}",
+        target_customer_id=customer_id,
+    )
+
+    return format_customer_payload(customer)
+
+
+@app.post("/master/users")
+def master_create_customer_user(
+    data: MasterUserCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+
+    email = data.email.strip().lower()
+    password = data.password.strip()
+    display_name = data.display_name.strip()
+    customer_id = int(data.customer_id)
+
+    if not password or not display_name:
+        raise HTTPException(status_code=422, detail="password and display_name are required")
+
+    if email in FAKE_USERS:
+        raise HTTPException(status_code=400, detail="User email already exists")
+
+    customer = find_customer(customer_id)
+
+    FAKE_USERS[email] = {
+        "password": password,
+        "role": "customer",
+        "customer_id": customer_id,
+        "display_name": display_name,
+        "access_status": customer.get("access_status", "active"),
+        "trading_status": customer.get("trading_status", "enabled"),
+        "subscription_status": customer.get("subscription_status", "active"),
+    }
+    FAKE_CUSTOMER_ACCOUNTS.setdefault(email, {})
+    if not isinstance(FAKE_CUSTOMER_ACCOUNTS[email], list):
+        FAKE_CUSTOMER_ACCOUNTS[email] = []
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_customer_user_created",
+        message=f"Created customer user {email}",
+        target_customer_id=customer_id,
+        target_user_email=email,
+    )
+
+    return {
+        "ok": True,
+        "email": email,
+        "role": "customer",
+        "customer_id": customer_id,
+        "display_name": display_name,
+    }
+
+
+@app.get("/master/customers/{customer_id}/accounts")
+def master_get_customer_accounts(
+    customer_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    find_customer(customer_id)
+    return get_accounts_for_customer(customer_id)
+
+
+@app.get("/master/customers/{customer_id}/strategies")
+def master_get_customer_strategies(
+    customer_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    find_customer(customer_id)
+    return get_strategies_for_customer(customer_id)
+
+
+@app.get("/master/audit_logs")
+def master_get_audit_logs(
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+    rows = sorted(AUDIT_LOGS, key=lambda x: x["created_utc"], reverse=True)
+    return {
+        "ok": True,
+        "count": len(rows[:limit]),
+        "items": rows[:limit],
     }
 
 
@@ -1585,4 +1908,3 @@ def debug_pending_by_consumer(
             "symbol": symbol_upper,
         },
     }
-
