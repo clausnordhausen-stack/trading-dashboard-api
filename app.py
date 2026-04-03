@@ -554,6 +554,240 @@ def seed_db_if_empty() -> None:
                     )
 
 
+def force_seed_defaults() -> Dict[str, Any]:
+    inserted_customers = 0
+    inserted_users = 0
+    inserted_accounts = 0
+    inserted_strategies = 0
+    inserted_setups = 0
+
+    with get_db() as conn:
+        for customer in SEED_CUSTOMERS.values():
+            existing_customer = conn.execute(
+                "SELECT id FROM customers WHERE id = ?",
+                (customer["id"],),
+            ).fetchone()
+            if not existing_customer:
+                conn.execute(
+                    """
+                    INSERT INTO customers (
+                        id, display_name, access_start_at, access_end_at,
+                        access_status, trading_status, subscription_status, grace_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        customer["id"],
+                        customer["display_name"],
+                        customer.get("access_start_at"),
+                        customer.get("access_end_at"),
+                        customer.get("access_status", "active"),
+                        customer.get("trading_status", "enabled"),
+                        customer.get("subscription_status", "active"),
+                        customer.get("grace_until"),
+                    ),
+                )
+                inserted_customers += 1
+
+        for email, user in SEED_USERS.items():
+            existing_user = conn.execute(
+                "SELECT email FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+
+            if existing_user:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET password = ?, role = ?, customer_id = ?, display_name = ?,
+                        access_status = ?, trading_status = ?, subscription_status = ?
+                    WHERE email = ?
+                    """,
+                    (
+                        user["password"],
+                        user["role"],
+                        user.get("customer_id"),
+                        user.get("display_name", email),
+                        user.get("access_status", "active"),
+                        user.get("trading_status", "enabled"),
+                        user.get("subscription_status", "active"),
+                        email,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO users (
+                        email, password, role, customer_id, display_name,
+                        access_status, trading_status, subscription_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        email,
+                        user["password"],
+                        user["role"],
+                        user.get("customer_id"),
+                        user.get("display_name", email),
+                        user.get("access_status", "active"),
+                        user.get("trading_status", "enabled"),
+                        user.get("subscription_status", "active"),
+                    ),
+                )
+                inserted_users += 1
+
+        for email, accounts in SEED_CUSTOMER_ACCOUNTS.items():
+            for account in accounts:
+                existing_account = conn.execute(
+                    "SELECT id FROM customer_accounts WHERE id = ?",
+                    (account["id"],),
+                ).fetchone()
+
+                if existing_account:
+                    conn.execute(
+                        """
+                        UPDATE customer_accounts
+                        SET user_email = ?, account_number = ?, broker = ?, broker_name = ?,
+                            account_label = ?, is_active = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            email,
+                            account["account_number"],
+                            account.get("broker"),
+                            account.get("broker_name"),
+                            account.get("account_label"),
+                            1 if account.get("is_active", True) else 0,
+                            account["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO customer_accounts (
+                            id, user_email, account_number, broker, broker_name,
+                            account_label, is_active
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            account["id"],
+                            email,
+                            account["account_number"],
+                            account.get("broker"),
+                            account.get("broker_name"),
+                            account.get("account_label"),
+                            1 if account.get("is_active", True) else 0,
+                        ),
+                    )
+                    inserted_accounts += 1
+
+        for account_id, strategies in SEED_ACCOUNT_STRATEGIES.items():
+            for strategy in strategies:
+                existing_strategy = conn.execute(
+                    "SELECT id FROM customer_strategies WHERE id = ?",
+                    (strategy["id"],),
+                ).fetchone()
+
+                if existing_strategy:
+                    conn.execute(
+                        """
+                        UPDATE customer_strategies
+                        SET account_id = ?, symbol = ?, name = ?, strategy_name = ?,
+                            strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            account_id,
+                            strategy["symbol"].upper(),
+                            strategy.get("name"),
+                            strategy.get("strategy_name") or strategy.get("name"),
+                            strategy["strategy_code"],
+                            str(strategy["magic"]),
+                            strategy.get("risk_tier", "balanced"),
+                            1 if strategy.get("is_enabled", True) else 0,
+                            strategy["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO customer_strategies (
+                            id, account_id, symbol, name, strategy_name,
+                            strategy_code, magic, risk_tier, is_enabled
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            strategy["id"],
+                            account_id,
+                            strategy["symbol"].upper(),
+                            strategy.get("name"),
+                            strategy.get("strategy_name") or strategy.get("name"),
+                            strategy["strategy_code"],
+                            str(strategy["magic"]),
+                            strategy.get("risk_tier", "balanced"),
+                            1 if strategy.get("is_enabled", True) else 0,
+                        ),
+                    )
+                    inserted_strategies += 1
+
+        for email, account_map in SEED_CUSTOMER_SETUP.items():
+            for account_id, symbol_map in account_map.items():
+                for symbol, setup in symbol_map.items():
+                    existing_setup = conn.execute(
+                        """
+                        SELECT user_email
+                        FROM customer_strategy_setup
+                        WHERE user_email = ? AND account_id = ? AND symbol = ?
+                        """,
+                        (email, account_id, symbol.upper()),
+                    ).fetchone()
+
+                    if existing_setup:
+                        conn.execute(
+                            """
+                            UPDATE customer_strategy_setup
+                            SET enabled = ?, risk_tier = ?
+                            WHERE user_email = ? AND account_id = ? AND symbol = ?
+                            """,
+                            (
+                                1 if setup.get("enabled", True) else 0,
+                                setup.get("risk_tier", "balanced"),
+                                email,
+                                account_id,
+                                symbol.upper(),
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO customer_strategy_setup (
+                                user_email, account_id, symbol, enabled, risk_tier
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                email,
+                                account_id,
+                                symbol.upper(),
+                                1 if setup.get("enabled", True) else 0,
+                                setup.get("risk_tier", "balanced"),
+                            ),
+                        )
+                        inserted_setups += 1
+
+    return {
+        "ok": True,
+        "message": "Default users/customers/accounts/strategies seeded",
+        "db_path": DB_PATH,
+        "inserted_customers": inserted_customers,
+        "inserted_users": inserted_users,
+        "inserted_accounts": inserted_accounts,
+        "inserted_strategies": inserted_strategies,
+        "inserted_setups": inserted_setups,
+        "available_logins": [
+            {"email": "admin@claus.digital", "password": "123456", "role": "master"},
+            {"email": "test@test.com", "password": "123456", "role": "customer"},
+        ],
+    }
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
@@ -2623,6 +2857,32 @@ def gate_combo(
 # =========================================================
 # DEBUG (PUBLIC)
 # =========================================================
+
+@app.post("/debug/seed_users")
+def debug_seed_users() -> Dict[str, Any]:
+    init_db()
+    return force_seed_defaults()
+
+
+@app.get("/debug/users")
+def debug_users() -> Dict[str, Any]:
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT email, role, customer_id, display_name,
+                   access_status, trading_status, subscription_status
+            FROM users
+            ORDER BY email
+            """
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "db_path": DB_PATH,
+        "count": len(rows),
+        "items": rows_to_dicts(rows),
+    }
+
 
 @app.get("/debug/state")
 def debug_state(
