@@ -74,6 +74,27 @@ SEED_CUSTOMERS: Dict[int, Dict[str, Any]] = {
     },
 }
 
+SEED_EXPERT_ADVISORS: List[Dict[str, Any]] = [
+    {
+        "id": 1,
+        "ea_name": "Gold Core EA",
+        "ea_code": "gold_core_ea",
+        "version": "1.0.0",
+        "default_symbol": "XAUUSD",
+        "default_magic": "61001",
+        "is_active": True,
+    },
+    {
+        "id": 2,
+        "ea_name": "BTC Core EA",
+        "ea_code": "btc_core_ea",
+        "version": "1.0.0",
+        "default_symbol": "BTCUSD",
+        "default_magic": "61002",
+        "is_active": True,
+    },
+]
+
 SEED_CUSTOMER_ACCOUNTS: Dict[str, List[Dict[str, Any]]] = {
     "test@test.com": [
         {
@@ -117,6 +138,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "61001",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 1,
         },
         {
             "id": 2,
@@ -128,6 +150,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "61002",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 2,
         },
     ],
     2: [
@@ -141,6 +164,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "61001",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 1,
         },
         {
             "id": 4,
@@ -152,6 +176,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "61002",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 2,
         },
     ],
     10: [
@@ -165,6 +190,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "777",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 1,
         },
         {
             "id": 6,
@@ -176,6 +202,7 @@ SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
             "magic": "62001",
             "risk_tier": "balanced",
             "is_enabled": True,
+            "ea_id": 2,
         },
     ],
 }
@@ -245,6 +272,7 @@ class CustomerStrategyCreate(BaseModel):
     magic: int
     risk_tier: str = "balanced"
     is_enabled: bool = True
+    ea_id: Optional[int] = None
 
 
 class CustomerStrategyUpdate(BaseModel):
@@ -255,6 +283,7 @@ class CustomerStrategyUpdate(BaseModel):
     magic: int
     risk_tier: str = "balanced"
     is_enabled: bool = True
+    ea_id: Optional[int] = None
 
 
 class MasterCustomerCreate(BaseModel):
@@ -306,6 +335,7 @@ class MasterCustomerStrategyCreate(BaseModel):
     magic: int
     risk_tier: str = "balanced"
     is_enabled: bool = True
+    ea_id: Optional[int] = None
 
 
 class MasterCustomerStrategyUpdate(BaseModel):
@@ -316,6 +346,25 @@ class MasterCustomerStrategyUpdate(BaseModel):
     magic: int
     risk_tier: str = "balanced"
     is_enabled: bool = True
+    ea_id: Optional[int] = None
+
+
+class ExpertAdvisorCreate(BaseModel):
+    ea_name: str
+    ea_code: str
+    version: Optional[str] = None
+    default_symbol: Optional[str] = None
+    default_magic: Optional[int] = None
+    is_active: bool = True
+
+
+class ExpertAdvisorUpdate(BaseModel):
+    ea_name: str
+    ea_code: str
+    version: Optional[str] = None
+    default_symbol: Optional[str] = None
+    default_magic: Optional[int] = None
+    is_active: bool = True
 
 
 class TVSignalIn(BaseModel):
@@ -395,6 +444,16 @@ def init_db() -> None:
                 FOREIGN KEY(customer_id) REFERENCES customers(id)
             );
 
+            CREATE TABLE IF NOT EXISTS expert_advisors (
+                id INTEGER PRIMARY KEY,
+                ea_name TEXT NOT NULL,
+                ea_code TEXT NOT NULL UNIQUE,
+                version TEXT,
+                default_symbol TEXT,
+                default_magic TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
             CREATE TABLE IF NOT EXISTS customer_accounts (
                 id INTEGER PRIMARY KEY,
                 user_email TEXT NOT NULL,
@@ -417,8 +476,10 @@ def init_db() -> None:
                 magic TEXT NOT NULL,
                 risk_tier TEXT NOT NULL DEFAULT 'balanced',
                 is_enabled INTEGER NOT NULL DEFAULT 1,
+                ea_id INTEGER,
                 UNIQUE(account_id, symbol, magic),
-                FOREIGN KEY(account_id) REFERENCES customer_accounts(id) ON DELETE CASCADE
+                FOREIGN KEY(account_id) REFERENCES customer_accounts(id) ON DELETE CASCADE,
+                FOREIGN KEY(ea_id) REFERENCES expert_advisors(id)
             );
 
             CREATE TABLE IF NOT EXISTS customer_strategy_setup (
@@ -445,6 +506,34 @@ def init_db() -> None:
             );
             """
         )
+
+
+def run_db_migrations() -> None:
+    with get_db() as conn:
+        expert_advisors_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='expert_advisors'"
+        ).fetchone()
+        if not expert_advisors_exists:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expert_advisors (
+                    id INTEGER PRIMARY KEY,
+                    ea_name TEXT NOT NULL,
+                    ea_code TEXT NOT NULL UNIQUE,
+                    version TEXT,
+                    default_symbol TEXT,
+                    default_magic TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+
+        strategy_columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(customer_strategies)").fetchall()
+        ]
+        if "ea_id" not in strategy_columns:
+            conn.execute("ALTER TABLE customer_strategies ADD COLUMN ea_id INTEGER")
 
 
 def seed_db_if_empty() -> None:
@@ -493,6 +582,24 @@ def seed_db_if_empty() -> None:
                 ),
             )
 
+        for ea in SEED_EXPERT_ADVISORS:
+            conn.execute(
+                """
+                INSERT INTO expert_advisors (
+                    id, ea_name, ea_code, version, default_symbol, default_magic, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ea["id"],
+                    ea["ea_name"],
+                    ea["ea_code"],
+                    ea.get("version"),
+                    ea.get("default_symbol"),
+                    ea.get("default_magic"),
+                    1 if ea.get("is_active", True) else 0,
+                ),
+            )
+
         for email, accounts in SEED_CUSTOMER_ACCOUNTS.items():
             for account in accounts:
                 conn.execute(
@@ -519,8 +626,8 @@ def seed_db_if_empty() -> None:
                     """
                     INSERT INTO customer_strategies (
                         id, account_id, symbol, name, strategy_name,
-                        strategy_code, magic, risk_tier, is_enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        strategy_code, magic, risk_tier, is_enabled, ea_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         strategy["id"],
@@ -532,6 +639,7 @@ def seed_db_if_empty() -> None:
                         str(strategy["magic"]),
                         strategy.get("risk_tier", "balanced"),
                         1 if strategy.get("is_enabled", True) else 0,
+                        strategy.get("ea_id"),
                     ),
                 )
 
@@ -557,6 +665,7 @@ def seed_db_if_empty() -> None:
 def force_seed_defaults() -> Dict[str, Any]:
     inserted_customers = 0
     inserted_users = 0
+    inserted_eas = 0
     inserted_accounts = 0
     inserted_strategies = 0
     inserted_setups = 0
@@ -634,6 +743,48 @@ def force_seed_defaults() -> Dict[str, Any]:
                 )
                 inserted_users += 1
 
+        for ea in SEED_EXPERT_ADVISORS:
+            existing_ea = conn.execute(
+                "SELECT id FROM expert_advisors WHERE id = ?",
+                (ea["id"],),
+            ).fetchone()
+
+            if existing_ea:
+                conn.execute(
+                    """
+                    UPDATE expert_advisors
+                    SET ea_name = ?, ea_code = ?, version = ?, default_symbol = ?, default_magic = ?, is_active = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        ea["ea_name"],
+                        ea["ea_code"],
+                        ea.get("version"),
+                        ea.get("default_symbol"),
+                        ea.get("default_magic"),
+                        1 if ea.get("is_active", True) else 0,
+                        ea["id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO expert_advisors (
+                        id, ea_name, ea_code, version, default_symbol, default_magic, is_active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ea["id"],
+                        ea["ea_name"],
+                        ea["ea_code"],
+                        ea.get("version"),
+                        ea.get("default_symbol"),
+                        ea.get("default_magic"),
+                        1 if ea.get("is_active", True) else 0,
+                    ),
+                )
+                inserted_eas += 1
+
         for email, accounts in SEED_CUSTOMER_ACCOUNTS.items():
             for account in accounts:
                 existing_account = conn.execute(
@@ -691,7 +842,7 @@ def force_seed_defaults() -> Dict[str, Any]:
                         """
                         UPDATE customer_strategies
                         SET account_id = ?, symbol = ?, name = ?, strategy_name = ?,
-                            strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?
+                            strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?, ea_id = ?
                         WHERE id = ?
                         """,
                         (
@@ -703,6 +854,7 @@ def force_seed_defaults() -> Dict[str, Any]:
                             str(strategy["magic"]),
                             strategy.get("risk_tier", "balanced"),
                             1 if strategy.get("is_enabled", True) else 0,
+                            strategy.get("ea_id"),
                             strategy["id"],
                         ),
                     )
@@ -711,8 +863,8 @@ def force_seed_defaults() -> Dict[str, Any]:
                         """
                         INSERT INTO customer_strategies (
                             id, account_id, symbol, name, strategy_name,
-                            strategy_code, magic, risk_tier, is_enabled
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            strategy_code, magic, risk_tier, is_enabled, ea_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             strategy["id"],
@@ -724,6 +876,7 @@ def force_seed_defaults() -> Dict[str, Any]:
                             str(strategy["magic"]),
                             strategy.get("risk_tier", "balanced"),
                             1 if strategy.get("is_enabled", True) else 0,
+                            strategy.get("ea_id"),
                         ),
                     )
                     inserted_strategies += 1
@@ -774,10 +927,11 @@ def force_seed_defaults() -> Dict[str, Any]:
 
     return {
         "ok": True,
-        "message": "Default users/customers/accounts/strategies seeded",
+        "message": "Default users/customers/accounts/strategies/eas seeded",
         "db_path": DB_PATH,
         "inserted_customers": inserted_customers,
         "inserted_users": inserted_users,
+        "inserted_eas": inserted_eas,
         "inserted_accounts": inserted_accounts,
         "inserted_strategies": inserted_strategies,
         "inserted_setups": inserted_setups,
@@ -791,6 +945,7 @@ def force_seed_defaults() -> Dict[str, Any]:
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+    run_db_migrations()
     seed_db_if_empty()
 
 # =========================================================
@@ -805,7 +960,7 @@ def now_utc_iso() -> str:
     return now_utc().isoformat()
 
 
-def parse_dt(value: Optional[str]) -> Optional[datetime]:
+def parse_dt(value: Optional[str]) -> Optional[datetime]]:
     if not value:
         return None
     try:
@@ -870,6 +1025,68 @@ def require_master(current_user: Dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="Not allowed")
 
 
+def next_ea_id() -> int:
+    with get_db() as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM expert_advisors").fetchone()
+    return int(row["next_id"])
+
+
+def find_ea(ea_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, ea_name, ea_code, version, default_symbol, default_magic, is_active
+            FROM expert_advisors
+            WHERE id = ?
+            """,
+            (ea_id,),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Expert advisor not found")
+
+    item = dict(row)
+    item["is_active"] = bool(item.get("is_active", 1))
+    return item
+
+
+def list_eas() -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ea_name, ea_code, version, default_symbol, default_magic, is_active
+            FROM expert_advisors
+            ORDER BY ea_name, id
+            """
+        ).fetchall()
+
+    result = rows_to_dicts(rows)
+    for row in result:
+        row["is_active"] = bool(row.get("is_active", 1))
+    return result
+
+
+def format_ea_payload(ea: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(ea["id"]),
+        "ea_name": ea["ea_name"],
+        "ea_code": ea["ea_code"],
+        "version": ea.get("version"),
+        "default_symbol": ea.get("default_symbol"),
+        "default_magic": str(ea.get("default_magic")) if ea.get("default_magic") is not None else None,
+        "is_active": bool(ea.get("is_active", True)),
+    }
+
+
+def get_ea_payload_or_none(ea_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if ea_id is None:
+        return None
+    try:
+        return format_ea_payload(find_ea(int(ea_id)))
+    except HTTPException:
+        return None
+
+
 def get_user_accounts(email: str) -> List[Dict[str, Any]]:
     with get_db() as conn:
         rows = conn.execute(
@@ -892,7 +1109,7 @@ def get_account_strategies(account_id: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT id, account_id, symbol, name, strategy_name, strategy_code,
-                   magic, risk_tier, is_enabled
+                   magic, risk_tier, is_enabled, ea_id
             FROM customer_strategies
             WHERE account_id = ?
             ORDER BY id
@@ -976,6 +1193,9 @@ def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
             strategy_enabled = bool(strategy.get("is_enabled", True)) and bool(setup["enabled"])
             risk_tier = setup["risk_tier"]
 
+            ea_id = strategy.get("ea_id")
+            ea = get_ea_payload_or_none(ea_id)
+
             enriched_strategies.append(
                 {
                     "id": strategy.get("id"),
@@ -998,6 +1218,8 @@ def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
                     "maxLot": 1.00,
                     "max_lot": 1.00,
                     "color": "#F7931A" if symbol == "BTCUSD" else "#D4AF37",
+                    "ea_id": ea_id,
+                    "ea": ea,
                 }
             )
 
@@ -1094,6 +1316,7 @@ def find_strategy_for_account_symbol_magic(
                 cs.magic,
                 cs.risk_tier AS strategy_risk_tier,
                 cs.is_enabled,
+                cs.ea_id,
                 u.email AS user_email
             FROM customer_accounts ca
             JOIN customer_strategies cs ON cs.account_id = ca.id
@@ -1121,6 +1344,7 @@ def find_strategy_for_account_symbol_magic(
             "enabled": enabled,
             "is_enabled": bool(row_dict["is_enabled"]),
             "risk_tier": setup["risk_tier"],
+            "ea_id": row_dict.get("ea_id"),
         }
 
     return None
@@ -1262,7 +1486,8 @@ def find_strategy_for_user(email: str, strategy_id: int) -> Dict[str, Any]:
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT cs.*
+            SELECT cs.id, cs.account_id, cs.symbol, cs.name, cs.strategy_name,
+                   cs.strategy_code, cs.magic, cs.risk_tier, cs.is_enabled, cs.ea_id
             FROM customer_strategies cs
             JOIN customer_accounts ca ON ca.id = cs.account_id
             WHERE ca.user_email = ? AND cs.id = ?
@@ -1320,6 +1545,9 @@ def format_account_payload(account: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def format_strategy_payload(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    ea_id = strategy.get("ea_id")
+    ea = get_ea_payload_or_none(ea_id)
+
     return {
         "id": int(strategy["id"]),
         "account_id": strategy.get("account_id"),
@@ -1330,6 +1558,8 @@ def format_strategy_payload(strategy: Dict[str, Any]) -> Dict[str, Any]:
         "magic": str(strategy.get("magic", "")),
         "risk_tier": strategy.get("risk_tier", "balanced"),
         "is_enabled": bool(strategy.get("is_enabled", True)),
+        "ea_id": ea_id,
+        "ea": ea,
     }
 
 
@@ -1718,6 +1948,10 @@ def create_customer_strategy(
     strategy_name = data.strategy_name.strip()
     magic = str(data.magic).strip()
     risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        find_ea(int(ea_id))
 
     if not symbol or not strategy_code or not strategy_name or not magic:
         raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
@@ -1734,8 +1968,8 @@ def create_customer_strategy(
             """
             INSERT INTO customer_strategies (
                 id, account_id, symbol, name, strategy_name, strategy_code,
-                magic, risk_tier, is_enabled
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                magic, risk_tier, is_enabled, ea_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 strategy_id,
@@ -1747,6 +1981,7 @@ def create_customer_strategy(
                 magic,
                 risk_tier,
                 1 if data.is_enabled else 0,
+                ea_id,
             ),
         )
 
@@ -1788,6 +2023,10 @@ def update_customer_strategy(
     strategy_name = data.strategy_name.strip()
     magic = str(data.magic).strip()
     risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        find_ea(int(ea_id))
 
     if not symbol or not strategy_code or not strategy_name or not magic:
         raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
@@ -1805,7 +2044,7 @@ def update_customer_strategy(
             """
             UPDATE customer_strategies
             SET account_id = ?, symbol = ?, name = ?, strategy_name = ?,
-                strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?
+                strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?, ea_id = ?
             WHERE id = ?
             """,
             (
@@ -1817,6 +2056,7 @@ def update_customer_strategy(
                 magic,
                 risk_tier,
                 1 if data.is_enabled else 0,
+                ea_id,
                 strategy_id,
             ),
         )
@@ -1933,6 +2173,144 @@ def update_strategy_setup(
 # =========================================================
 # MASTER ADMIN (AUTH REQUIRED)
 # =========================================================
+
+@app.get("/master/eas")
+def master_get_eas(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    return [format_ea_payload(item) for item in list_eas()]
+
+
+@app.post("/master/eas")
+def master_create_ea(
+    data: ExpertAdvisorCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+
+    ea_name = data.ea_name.strip()
+    ea_code = data.ea_code.strip().lower()
+    version = data.version.strip() if data.version else None
+    default_symbol = data.default_symbol.strip().upper() if data.default_symbol else None
+    default_magic = str(data.default_magic).strip() if data.default_magic is not None else None
+
+    if not ea_name or not ea_code:
+        raise HTTPException(status_code=422, detail="ea_name and ea_code are required")
+
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM expert_advisors WHERE ea_code = ?",
+            (ea_code,),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="EA code already exists")
+
+        ea_id = next_ea_id()
+        conn.execute(
+            """
+            INSERT INTO expert_advisors (
+                id, ea_name, ea_code, version, default_symbol, default_magic, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ea_id,
+                ea_name,
+                ea_code,
+                version,
+                default_symbol,
+                default_magic,
+                1 if data.is_active else 0,
+            ),
+        )
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_ea_created",
+        message=f"Created EA {ea_name}",
+    )
+
+    return format_ea_payload(find_ea(ea_id))
+
+
+@app.put("/master/eas/{ea_id}")
+def master_update_ea(
+    ea_id: int,
+    data: ExpertAdvisorUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_ea(ea_id)
+
+    ea_name = data.ea_name.strip()
+    ea_code = data.ea_code.strip().lower()
+    version = data.version.strip() if data.version else None
+    default_symbol = data.default_symbol.strip().upper() if data.default_symbol else None
+    default_magic = str(data.default_magic).strip() if data.default_magic is not None else None
+
+    if not ea_name or not ea_code:
+        raise HTTPException(status_code=422, detail="ea_name and ea_code are required")
+
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM expert_advisors WHERE ea_code = ? AND id != ?",
+            (ea_code, ea_id),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="EA code already exists")
+
+        conn.execute(
+            """
+            UPDATE expert_advisors
+            SET ea_name = ?, ea_code = ?, version = ?, default_symbol = ?, default_magic = ?, is_active = ?
+            WHERE id = ?
+            """,
+            (
+                ea_name,
+                ea_code,
+                version,
+                default_symbol,
+                default_magic,
+                1 if data.is_active else 0,
+                ea_id,
+            ),
+        )
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_ea_updated",
+        message=f"Updated EA {ea_name}",
+    )
+
+    return format_ea_payload(find_ea(ea_id))
+
+
+@app.delete("/master/eas/{ea_id}")
+def master_disable_ea(
+    ea_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+    ea = find_ea(ea_id)
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE expert_advisors SET is_active = 0 WHERE id = ?",
+            (ea_id,),
+        )
+
+    write_audit_log(
+        actor_email=current_user["email"],
+        action_type="master_ea_disabled",
+        message=f"Disabled EA {ea['ea_name']}",
+    )
+
+    return {
+        "ok": True,
+        "message": "EA disabled",
+        "ea_id": ea_id,
+    }
+
 
 @app.get("/master/customers")
 def master_get_customers(
@@ -2281,6 +2659,10 @@ def master_create_customer_strategy(
     strategy_name = data.strategy_name.strip()
     magic = str(data.magic).strip()
     risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        find_ea(int(ea_id))
 
     if not symbol or not strategy_code or not strategy_name or not magic:
         raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
@@ -2297,8 +2679,8 @@ def master_create_customer_strategy(
             """
             INSERT INTO customer_strategies (
                 id, account_id, symbol, name, strategy_name, strategy_code,
-                magic, risk_tier, is_enabled
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                magic, risk_tier, is_enabled, ea_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 strategy_id,
@@ -2310,6 +2692,7 @@ def master_create_customer_strategy(
                 magic,
                 risk_tier,
                 1 if data.is_enabled else 0,
+                ea_id,
             ),
         )
 
@@ -2348,6 +2731,10 @@ def master_update_customer_strategy(
     strategy_name = data.strategy_name.strip()
     magic = str(data.magic).strip()
     risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        find_ea(int(ea_id))
 
     if not symbol or not strategy_code or not strategy_name or not magic:
         raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
@@ -2365,7 +2752,7 @@ def master_update_customer_strategy(
             """
             UPDATE customer_strategies
             SET account_id = ?, symbol = ?, name = ?, strategy_name = ?,
-                strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?
+                strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?, ea_id = ?
             WHERE id = ?
             """,
             (
@@ -2377,6 +2764,7 @@ def master_update_customer_strategy(
                 magic,
                 risk_tier,
                 1 if data.is_enabled else 0,
+                ea_id,
                 strategy_id,
             ),
         )
@@ -2861,6 +3249,7 @@ def gate_combo(
 @app.post("/debug/seed_users")
 def debug_seed_users() -> Dict[str, Any]:
     init_db()
+    run_db_migrations()
     return force_seed_defaults()
 
 
