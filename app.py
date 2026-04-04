@@ -960,7 +960,7 @@ def now_utc_iso() -> str:
     return now_utc().isoformat()
 
 
-def parse_dt(value: Optional[str]) -> Optional[datetime]]:
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
